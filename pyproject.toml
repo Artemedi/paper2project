@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paper2project"
+version = "1.0.1"
+description = "Evidence-backed research applicability experiments for project memories, over CLI and MCP"
+readme = "docs/product/README.md"
+license-files = ["LICENSE", "NOTICE.md", "licenses/Paper2Agent-MIT.txt"]
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = []
+
+[project.optional-dependencies]
+pdf = ["pypdf==6.18.1"]
+
+[project.scripts]
+paper2project = "paper2project.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+paper2project = ["templates/*.md", "templates/*.json"]

@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import hashlib
 import json
 import math
@@ -87,6 +90,11 @@ def regular_file(path):
             os.close(file_fd)
         os.close(directory)
 
+
+class WorkspaceBusy(ValueError):
+    """Another writer currently owns the workspace."""
+
+
 class _WorkspaceLock:
     """One flock per canonical workspace and process; re-entrant for the owning thread only, fail-fast for everyone else."""
 
@@ -103,14 +111,14 @@ class _WorkspaceLock:
             self.depth += 1
             return
         if not self.mutex.acquire(blocking=False):
-            raise ValueError("workspace is busy: another writer holds the lock")
+            raise WorkspaceBusy("workspace is busy: another writer holds the lock")
         try:
             fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 os.close(fd)
-                raise ValueError("workspace is busy: another writer holds the lock") from None
+                raise WorkspaceBusy("workspace is busy: another writer holds the lock") from None
             except BaseException:
                 os.close(fd)
                 raise
@@ -148,11 +156,14 @@ def _forget_locks_in_child():
         lock.mutex, lock.owner, lock.depth, lock.fd = threading.Lock(), None, 0, None
 
 
-os.register_at_fork(after_in_child=_forget_locks_in_child)
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_locks_in_child)
 
 
 class Store:
     def __init__(self, root):
+        if fcntl is None:
+            raise ValueError("Paper2Project requires a Unix filesystem lock. On Windows, run it in WSL with a Linux workspace.")
         self.root = Path(root).absolute()
         if self.root.is_symlink():
             raise ValueError("Workspace must not be a symlink")
@@ -185,6 +196,14 @@ class Store:
             self._lock.release()
 
     @contextmanager
+    def idle_writer(self):
+        """Hold the writer lock only if no writer, including this thread, is active."""
+        if self._lock.owner == threading.get_ident():
+            raise WorkspaceBusy("workspace is busy: current thread holds the lock")
+        with self.writer():
+            yield
+
+    @contextmanager
     def db(self):
         connection = sqlite3.connect(self.database, timeout=30)
         try:
@@ -209,7 +228,7 @@ class Store:
                 os.link(temporary, path)
                 directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
                 try:
-                    os.fsync(directory)  # make the object name durable before metadata can reference it
+                    os.fsync(directory)  # publish the object name before committing its metadata reference
                 finally:
                     os.close(directory)
             except FileExistsError:
@@ -237,6 +256,18 @@ class Store:
     def json(self, key):
         return loads(self.blob(key))
 
+    @staticmethod
+    def evidence_digest(project_id, analysis, plans, *, job_id, research_snapshot, project_snapshot, author):
+        scope = {"schema": 2, "job_id": job_id, "research_snapshot": research_snapshot,
+                 "project_snapshot": project_snapshot, "author": author,
+                 "project_id": project_id, "analysis": analysis, "experiments": [
+            {"id": entry["id"], "plan": entry["plan_hash"], "source_tree": entry["source_tree"],
+             "input_tree": entry["input_tree"],
+             **({"reference_sha256": entry["reference_sha256"]} if entry.get("reference_sha256") else {}),
+             "runs": [[run["id"], run["status"], run.get("sealed")] for run in entry["runs"]]}
+            for entry in plans]}
+        return digest(dumps(scope).encode())
+
     def save(self, kind, key, value):
         identifier(kind)
         identifier(key)
@@ -253,8 +284,15 @@ class Store:
             raise ValueError(f"Unknown {kind}: {key}")
         return loads(row[0])
 
-    def list(self, kind):
+    def list(self, kind, *, insertion_order=False):
         identifier(kind)
         with self.db() as db:
-            rows = db.execute("SELECT body FROM records WHERE kind=? ORDER BY id", (kind,)).fetchall()
-        return [loads(row[0]) for row in rows]
+            order = "rowid" if insertion_order else "id"
+            rows = db.execute(f"SELECT id,body FROM records WHERE kind=? ORDER BY {order}", (kind,)).fetchall()
+        records = []
+        for key, body in rows:
+            record = loads(body)
+            if kind == "run" and record.get("id") != key:
+                raise ValueError("Run record index disagrees with its body: " + key)
+            records.append(record)
+        return records

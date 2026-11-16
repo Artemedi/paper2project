@@ -196,14 +196,13 @@ class PublicSecurityPort(unittest.TestCase):
         self.assertIn("special file", result["error"])
 
     def test_stop_container_cleanup_is_bounded(self):
-        proc = Mock(pid=42)
-        with patch.object(execution, "podman_command", return_value=["podman"]), \
-             patch.object(execution.subprocess, "run", return_value=Mock(returncode=0)) as run, \
-             patch.object(execution.os, "killpg"):
-            execution.stop_container(proc, "test-container")
-        self.assertIn(["podman", "rm", "-f", "--time", "1", "test-container"],
-                      [x.args[0] for x in run.call_args_list])
-        proc.wait.assert_called_once_with(timeout=10)
+        proc = Mock()
+        with patch.object(execution.os, "close") as close, \
+             patch.object(execution, "remove_container") as remove:
+            execution.stop_container(proc, "test-container", 42)
+        close.assert_called_once_with(42)
+        proc.wait.assert_called_once_with(timeout=35)
+        remove.assert_called_once_with("test-container")
 
     def test_release_never_archives_untracked_paths(self):
         repo = self.root / "release"
@@ -249,6 +248,8 @@ class PublicSecurityPort(unittest.TestCase):
                 return row
             def put_json(self, value):
                 return "immutable-result"
+            def list(self, kind, **kwargs):
+                return []
         class FakeApp:
             def __init__(self, store):
                 self.store = store

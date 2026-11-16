@@ -7,6 +7,7 @@ state never enter the container, so the experiment cannot rewrite its own verdic
 from __future__ import annotations
 
 import hashlib
+from fractions import Fraction
 import math
 import os
 from pathlib import Path
@@ -14,12 +15,13 @@ import re
 import select
 import shlex
 import shutil
-import signal
 import stat
 import subprocess
+import sys
 import time
 
-from .store import digest, dumps, loads, now, regular_file, unique
+from .findings import test_binding, artifact_anchor, evidence_key, finding_status, supported_tests
+from .store import WorkspaceBusy, digest, dumps, loads, now, regular_file, unique
 
 LIMITS = {"timeout": 120, "memory_mb": 1024, "cpus": 2, "pids": 128}
 MAX_RESULT = 1024 * 1024
@@ -75,6 +77,7 @@ def file_digest(path, limit=None):
                 raise ValueError(f"File larger than {limit} bytes: {path.name}")
             hasher.update(block)
     return hasher.hexdigest()
+
 
 def bounded_tree(root):
     paths = []
@@ -150,36 +153,56 @@ def copy_tree(source, destination, expected):
     return destination
 
 
-def git_head(source):
-    """Commit a checkout claims to be at, read without running git; None if unknowable."""
-    git = Path(source) / ".git"
-    if git.is_symlink() or not git.is_dir():
-        return None
-    root = git.resolve()
+def git_head(source, *, local=None):
+    """Read checkout revision without running Git or following redirected metadata."""
+    source = Path(source).resolve()
+    pointer = source / ".git"
 
-    def read(path, limit=4096):
-        """Only regular files that stay inside .git; content is never trusted or echoed."""
-        resolved = path.resolve()
-        if path.is_symlink() or root not in resolved.parents or not resolved.is_file() or resolved.stat().st_size > limit:
+    def read(path, root, limit=4096):
+        if path.resolve() != path or not path.is_relative_to(root) or not path.is_file():
             return None
-        return resolved.read_text()
+        with path.open("rb") as stream:
+            data = stream.read(limit + 1)
+        return data.decode() if len(data) <= limit else None
 
     try:
-        head = (read(git / "HEAD") or "").strip()
+        if pointer.is_symlink():
+            return None
+        git = common = pointer
+        if pointer.is_file():
+            directive = (read(pointer, Path(source)) or "").strip()
+            if not directive.startswith("gitdir: "):
+                return None
+            target = Path(source) / directive.removeprefix("gitdir: ")
+            git = Path(os.path.abspath(target))
+            if ((local is not None and Path(local(git)) != git) or git.resolve() != git
+                    or git.parent.name != "worktrees"):
+                return None
+            common = git.parent.parent
+            if local is not None and Path(local(common)) != common:
+                return None
+            if (read(git / "commondir", git) or "").strip() != "../..":
+                return None
+            backlink = (read(git / "gitdir", git) or "").strip()
+            if not backlink or Path(os.path.abspath(git / backlink)) != pointer:
+                return None
+        elif not pointer.is_dir():
+            return None
+        head = (read(git / "HEAD", git) or "").strip()
         found = None
         if re.fullmatch(r"[0-9a-f]{40}", head):
             found = head
         elif head.startswith("ref: refs/") and ".." not in head:
             ref = head[5:]
-            value = read(git / ref)
+            value = read(common / ref, common)
             if value is not None:
                 found = value.strip()
             else:
-                for line in (read(git / "packed-refs", 8 << 20) or "").splitlines():
+                for line in (read(common / "packed-refs", common, 8 << 20) or "").splitlines():
                     if line.endswith(" " + ref):
                         found = line.split()[0]
         return found if found and re.fullmatch(r"[0-9a-f]{40}", found) else None
-    except (OSError, UnicodeError):
+    except (OSError, UnicodeError, ValueError, RuntimeError):
         return None
 
 
@@ -256,28 +279,33 @@ def paired_guard(guard, base, candidate):
     if result["baseline"] is None or result["actual"] is None:
         return {**result, "reason": "NON_FINITE_OR_MISSING_METRIC"}
     unit = guard["unit"]
-    delta = candidate - base if guard["direction"] == "higher_is_better" else base - candidate
+    base_decimal, candidate_decimal = Fraction(str(base)), Fraction(str(candidate))
+    delta_decimal = (candidate_decimal - base_decimal if guard["direction"] == "higher_is_better"
+                     else base_decimal - candidate_decimal)
     try:
         if unit == "speedup_ratio":
             if base <= 0 or candidate <= 0:
                 return {**result, "reason": "NON_POSITIVE_SPEEDUP_METRIC"}
-            ratio = base / candidate
+            ratio_decimal = base_decimal / candidate_decimal
+            ratio = ratio_decimal.numerator if ratio_decimal.denominator == 1 else float(ratio_decimal)
             if not number(ratio):
                 return {**result, "reason": "NON_FINITE_COMPARISON"}
-            return {**result, "ratio": ratio, "passed": ratio >= guard["min_ratio"]}
+            return {**result, "ratio": ratio, "ratio_exact": str(ratio_decimal),
+                    "passed": ratio_decimal >= Fraction(str(guard["min_ratio"]))}
         if unit == "relative_fraction" and base == 0:
             if guard.get("zero_baseline_policy") == "require_non_worse":
                 return {**result, "reason": "ZERO_BASE_NON_WORSE",
-                        "passed": delta >= 0 and guard.get("min_gain", 0) == 0}
+                        "passed": delta_decimal >= 0 and guard.get("min_gain", 0) == 0}
             return {**result, "reason": "ZERO_BASELINE_FOR_RELATIVE_METRIC"}
-        change = delta if unit == "absolute" else delta / abs(base)
+        change_decimal = delta_decimal if unit == "absolute" else delta_decimal / abs(base_decimal)
+        change = change_decimal.numerator if change_decimal.denominator == 1 else float(change_decimal)
     except OverflowError:
         return {**result, "reason": "NON_FINITE_COMPARISON"}
     if not number(change):
         return {**result, "reason": "NON_FINITE_COMPARISON"}
-    passed = ("min_gain" not in guard or change >= guard["min_gain"]) and (
-        "max_regression" not in guard or -change <= guard["max_regression"])
-    return {**result, "change": change, "passed": passed}
+    passed = ("min_gain" not in guard or change_decimal >= Fraction(str(guard["min_gain"]))) and (
+        "max_regression" not in guard or -change_decimal <= Fraction(str(guard["max_regression"])))
+    return {**result, "change": change, "change_exact": str(change_decimal), "passed": passed}
 
 
 def validate_plan(plan, project_ids):
@@ -294,7 +322,8 @@ def validate_plan(plan, project_ids):
             or not source["path"].strip() or not re.fullmatch(r"[0-9a-f]{40}", str(source.get("revision", ""))) \
             or not isinstance(source.get("license"), str) or not source["license"].strip():
         raise ValueError("source needs path, 40-hex revision and license")
-    if plan.get("input") is not None and (not isinstance(plan["input"], dict) or not isinstance(plan["input"].get("path"), str) or not plan["input"]["path"].strip()):
+    if plan.get("input") is not None and (not isinstance(plan["input"], dict) or not isinstance(plan["input"].get("path"), str)
+                                          or not plan["input"]["path"].strip()):
         raise ValueError("input must be {path}")
     if not isinstance(plan.get("arms"), dict):
         raise ValueError("arms must be {baseline, candidate}")
@@ -315,6 +344,8 @@ def validate_plan(plan, project_ids):
         paths.append(metric.get("path"))
         if not isinstance(metric.get("path"), str) or not re.fullmatch(r"[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*", metric["path"]):
             raise ValueError("metric.path must be a dotted result path")
+        if any(re.fullmatch(r"0[0-9]+", part) for part in metric["path"].split(".")):
+            raise ValueError("metric.path cannot use array indexes with leading zeros")
         comparison = metric.get("comparison", "exact")
         if comparison not in {"exact", "abs", "rel"}:
             raise ValueError("comparison must be exact, abs or rel")
@@ -364,14 +395,43 @@ def validate_plan(plan, project_ids):
     return {**plan, "limits": limits}
 
 
+def benefit_reference(app, project, reference, plan, source_tree, input_tree):
+    """Bind the declared expectations to an artifact frozen in the job snapshot."""
+    if not isinstance(reference, str):
+        raise ValueError("reference must name a frozen project attachment")
+    asset = app.store.json(project["snapshot"]).get("assets", {}).get(reference)
+    if asset is None:
+        raise ValueError("reference must name a frozen project attachment")
+    receipt = app.store.json(asset["sha256"])
+    expected = {metric["name"]: metric["expected"] for metric in plan["metrics"]}
+    if (not isinstance(receipt, dict) or type(receipt.get("schema")) is not int or receipt["schema"] != 1
+            or not isinstance(receipt.get("method"), str) or not receipt["method"].strip()
+            or receipt.get("source_tree") != source_tree["sha256"]
+            or receipt.get("input_tree") != input_tree["sha256"]
+            or dumps(receipt.get("expected")) != dumps(expected)):
+        raise ValueError("reference must document its method and match the source, inputs and expected values")
+    return asset["sha256"]
+
+
 def add_experiment(app, job_id, plan):
     job = app.store.get("job", job_id)
     if not job["analysis"]:
         raise ValueError("Submit a grounded analysis before registering experiments")
     plan = validate_plan(plan, {p["id"] for p in job["projects"]})
     assessment = next(a for a in app.store.json(job["analysis"])["assessments"] if a["project_id"] == plan["project_id"])
-    if assessment["relevance"] == "not_applicable":
-        raise ValueError("Analysis marked this project not_applicable; revise the analysis first")
+    project = next(p for p in job["projects"] if p["id"] == plan["project_id"])
+    if assessment["relevance"] == "findings_only":
+        if not isinstance(plan.get("finding_id"), str) or plan["finding_id"] not in {row["id"] for row in assessment["findings"]}:
+            raise ValueError("Scoped experiments must select a finding_id from this project")
+        provenance = plan.get("provenance")
+        if not isinstance(provenance, dict) or not all(
+                isinstance(provenance.get(key), str) and provenance[key].strip() for key in ("data", "comparison")):
+            raise ValueError("Scoped experiments need provenance describing the data and comparison")
+        assets = app.store.json(project["snapshot"]).get("assets", {})
+        oracle = artifact_anchor(provenance.get("oracle"), assets, app.store.blob)
+        plan = {**plan, "provenance": {"oracle": oracle, "data": provenance["data"], "comparison": provenance["comparison"]}}
+    elif "finding_id" in plan:
+        raise ValueError("finding_id requires a scoped analysis")
     source = Path(app.local(plan["source"]["path"]))
     inputs = Path(app.local(plan["input"]["path"])) if plan.get("input") else None
     mount_safe(source)
@@ -381,18 +441,37 @@ def add_experiment(app, job_id, plan):
     input_tree = tree_hash(inputs) if inputs else None
     if plan["kind"] == "project_benefit" and not input_tree["bytes"]:
         raise ValueError("project_benefit needs non-empty target data in the input directory")
-    head = git_head(source)
+    head = git_head(source, local=app.local)
     if head is not None and head != plan["source"]["revision"]:
         raise ValueError(f"Source checkout is at {head}, not the declared revision {plan['source']['revision']}")
+    reference = None
+    if "reference" in plan:
+        if plan["kind"] != "project_benefit" or head is None:
+            raise ValueError("A benefit reference requires project_benefit and a verified Git source revision in a supported checkout")
+        reference = benefit_reference(app, project, plan["reference"], plan, source_tree, input_tree)
     experiment_id = unique("exp")
     snapshot_dir = app.store.root / "snapshots" / experiment_id
-    source = copy_tree(source, snapshot_dir / "source", source_tree)
-    inputs = copy_tree(inputs, snapshot_dir / "input", input_tree) if inputs else None
+    source_copy = copy_tree(source, snapshot_dir / "source", source_tree)
+    if head is not None and git_head(source, local=app.local) != head:
+        shutil.rmtree(snapshot_dir)
+        raise ValueError("Source Git revision changed during registration")
+    try:
+        inputs = copy_tree(inputs, snapshot_dir / "input", input_tree) if inputs else None
+    except BaseException:
+        for directory in [source_copy, *source_copy.rglob("*")]:
+            if directory.is_dir():
+                directory.chmod(0o700)
+        shutil.rmtree(snapshot_dir)
+        raise
     entry = {"id": experiment_id, "job_id": job_id, "project_id": plan["project_id"], "kind": plan["kind"],
              "plan": app.store.put_json(plan), "created_at": now(), "head_matches": head is not None, "analysis": job["analysis"],
              "source_tree": source_tree, "input_tree": input_tree,
-             "source_path": str(source.resolve()), "input_path": str(inputs.resolve()) if inputs else None,
+             "source_path": str(source_copy.resolve()), "input_path": str(inputs.resolve()) if inputs else None,
              "origin_source_path": plan["source"]["path"], "origin_input_path": plan["input"]["path"] if plan.get("input") else None}
+    if reference:
+        entry["reference_sha256"] = reference
+    if plan.get("finding_id"):
+        entry.update(finding_id=plan["finding_id"], oracle_sha256=plan["provenance"]["oracle"]["sha256"])
     app.store.save("experiment", entry["id"], entry)
     app.event(job_id, "experiment", {"experiment": entry["id"], "plan": entry["plan"]})
     return entry
@@ -405,27 +484,46 @@ def experiments(app, job_id):
 SEALED = ("exit_code", "timed_out", "error", "result", "result_sha256")
 
 
+def run_identity(run):
+    return {key: run.get(key) for key in ("id", "experiment_id", "job_id", "plan", "source_tree", "input_tree", "image_id")}
+
+
 def evaluate(app, run):
     """Re-derive the verdict from the plan and stored result objects; the run row's own status is not trusted."""
     arms = run.get("arms") or {}
     if not arms:
-        return {**run, "status": "BLOCKED" if run.get("status") == "BLOCKED" else "FAIL"}
-    if not run.get("sealed"):  # unsealed interrupted arms are informative, never PASS
-        state = run.get("status")
-        return {**run, "status": state if state in {"RUNNING", "INTERRUPTED"} else "FAIL",
-                "reproduced": False, "benefit": None, "reason": run.get("reason") or "run has no sealed arm facts"}
-    facts = app.store.json(run["sealed"])  # rehashed on read
-    if set(facts) != set(arms):
-        return {**run, "status": "FAIL", "reproduced": False, "benefit": None, "reason": "sealed arm facts disagree with the run row"}
+        status = run.get("status")
+        return {**run, "status": status if status in {"BLOCKED", "RUNNING", "INTERRUPTED"} else "FAIL"}
+    if not run.get("sealed"):  # facts that decide the verdict must come from a hashed object, not from an editable row
+        if run.get("status") in {"RUNNING", "INTERRUPTED"}:
+            return {**run, "reproduced": False, "benefit": None}  # partial arms cannot establish PASS
+        return {**run, "status": "FAIL", "reproduced": False, "benefit": None, "reason": "run has no sealed arm facts"}
+    seal = app.store.json(run["sealed"])  # rehashed on read
+    if seal.get("schema") != 2:
+        return {**run, "status": "STALE", "checks": [], "reproduced": False, "benefit": None,
+                "reason": "Legacy seal has no run identity; register and run a new experiment"}
+    facts = seal.get("arms", {})
+    if seal.get("run") != run_identity(run) or set(facts) != set(arms) or set(arms) != set(ARMS):
+        return {**run, "status": "FAIL", "reproduced": False, "benefit": None, "reason": "sealed run identity or arms disagree with the run row"}
     plan = app.store.json(run["plan"])
-    loaded = {arm: {**rec, **facts[arm], "result": app.store.json(facts[arm]["result"]) if facts[arm].get("result") else None} for arm, rec in arms.items()}
+    verified = {arm: {**record, **facts[arm]} for arm, record in arms.items()}
+    loaded = {arm: {**record, "result": app.store.json(record["result"]) if record.get("result") else None}
+              for arm, record in verified.items()}
     checks, reproduced, benefit = score(plan, loaded)
-    return {**run, "checks": checks, "reproduced": reproduced, "benefit": benefit, "status": "PASS" if reproduced else "FAIL"}
+    return {**run, "arms": verified, "checks": checks, "reproduced": reproduced, "benefit": benefit, "status": "PASS" if reproduced else "FAIL"}
 
 
 def runs(app, experiment_id):
-    rows = sorted((r for r in app.store.list("run") if r["experiment_id"] == experiment_id), key=lambda r: r["started_at"])
-    return [evaluate(app, r) for r in rows]
+    experiment = app.store.get("experiment", experiment_id)
+    rows = (r for r in app.store.list("run", insertion_order=True) if r["experiment_id"] == experiment_id)
+    confirmed = []
+    for row in rows:
+        if any(row[field] != experiment[field] for field in ("job_id", "plan", "source_tree", "input_tree")):
+            confirmed.append({**row, "status": "FAIL", "reproduced": False, "benefit": None,
+                              "checks": [], "reason": "Run record does not match the registered experiment"})
+        else:
+            confirmed.append(evaluate(app, row))
+    return confirmed
 
 
 def mount_safe(path):
@@ -666,27 +764,44 @@ def output_breach(stdout, stderr, out, pids=()):
     return None
 
 
-def stop_container(proc, name):
-    """Kill by name first (killing the podman client does not stop the container), remove it, then end the client."""
-    for verb in (["kill", name], ["rm", "-f", "--time", "1", name]):
-        try:
-            subprocess.run([*podman_command(), *verb], capture_output=True, timeout=10)
-        except (OSError, subprocess.SubprocessError, ValueError):
-            pass
+class CleanupPending(RuntimeError):
+    """The attempt must stay recoverable until container cleanup can be confirmed."""
+
+
+def remove_container(name):
     try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
+        command = podman_command()
+        result = subprocess.run([*command, "container", "exists", name], capture_output=True, timeout=10)
+        if result.returncode == 0:
+            subprocess.run([*command, "rm", "-f", "--time", "1", name], capture_output=True, timeout=20)
+            result = subprocess.run([*command, "container", "exists", name], capture_output=True, timeout=10)
+        if result.returncode != 1:
+            raise CleanupPending("Unable to confirm container removal")
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        raise CleanupPending("Unable to confirm container removal") from exc
+
+
+def stop_container(proc, name, control_fd):
+    """Signal the launcher first and keep an unconfirmed cleanup recoverable."""
+    os.close(control_fd)
     try:
-        proc.wait(timeout=10)
+        proc.wait(timeout=35)
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("Unable to reap terminated container launcher") from exc
+        raise CleanupPending("Launcher has not finished stopping the container") from exc
+    except (KeyboardInterrupt, SystemExit) as exc:
+        raise CleanupPending("Launcher cleanup was interrupted") from exc
+    try:
+        remove_container(name)
+    except (KeyboardInterrupt, SystemExit) as exc:
+        raise CleanupPending("Container cleanup was interrupted") from exc
 
 
 def run_arm(app, plan, image, experiment, run_dir, arm):
     out = run_dir / arm / "output"
     out.mkdir(parents=True, mode=0o700)
-    name = unique("p2p-" + arm)
+    name = "p2p-" + run_dir.name + "-" + arm
+    run = app.store.get("run", run_dir.name)
+    app.store.save("run", run_dir.name, {**run, "active_container": name})
     argv = container_argv(plan["limits"], image, plan["arms"][arm], experiment["source_path"], experiment["input_path"], out, name)
     stdout, stderr = run_dir / arm / "stdout.txt", run_dir / arm / "stderr.txt"
     started = time.monotonic()
@@ -694,13 +809,71 @@ def run_arm(app, plan, image, experiment, run_dir, arm):
               "output_files": {}, "stdout": "", "stderr": "", "stdout_sha256": None, "stderr_sha256": None}
     try:
         with stdout.open("wb") as o, stderr.open("wb") as e:
-            proc = subprocess.Popen(argv, stdout=o, stderr=e, stdin=subprocess.DEVNULL, start_new_session=True)
+            # A surviving launcher retains the workspace lock until the Podman client exits.
+            # Recovery cannot mistake the launch window for an absent container.
+            lock_fd = app.store._lock.fd
+            if lock_fd is None:
+                raise ValueError("Container execution requires the workspace writer lock")
+            read_fd, write_fd = os.pipe()
+            launcher = """
+import os, select, signal, subprocess, sys
+read_fd = int(sys.argv[1])
+name = sys.argv[2]
+podman_count = int(sys.argv[3])
+command = sys.argv[4:]
+poller = select.poll()
+poller.register(read_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+client = subprocess.Popen(command, start_new_session=True)
+try:
+    while client.poll() is None:
+        ready = poller.poll(100)
+        if not ready:
+            continue
+        if not os.read(read_fd, 1):
+            raise EOFError("Runner stopped")
+except BaseException:
+    if client.poll() is None:
+        try:
+            os.killpg(client.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        client.wait()
+        try:
+            subprocess.run([*command[:podman_count], "kill", name],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            subprocess.run([*command[:podman_count], "rm", "-f", "--time", "1", name],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    raise SystemExit(1)
+raise SystemExit(client.returncode)
+"""
+            try:
+                proc = subprocess.Popen([sys.executable, "-c", launcher, str(read_fd), name,
+                                         str(len(podman_command())), *argv],
+                                        stdout=o, stderr=e, stdin=subprocess.DEVNULL,
+                                        start_new_session=True, pass_fds=(lock_fd, read_fd))
+            except BaseException:
+                os.close(write_fd)
+                raise
+            finally:
+                os.close(read_fd)
             deadline = time.monotonic() + plan["limits"]["timeout"] + 30  # the container has its own --timeout; the extra time is cleanup
+            def stop():
+                nonlocal write_fd
+                control_fd, write_fd = write_fd, None
+                stop_container(proc, name, control_fd)
+
             root_pid = None
             try:
                 while True:
                     try:
                         record["exit_code"] = proc.wait(timeout=POLL_SECONDS)
+                        if record["exit_code"] != 0:
+                            remove_container(name)
                         break
                     except subprocess.TimeoutExpired:
                         pass
@@ -710,7 +883,7 @@ def run_arm(app, plan, image, experiment, run_dir, arm):
                     except OSError as exc:  # an output tree the watchdog cannot read is not an output tree it can ignore
                         breach = "output directory cannot be inspected (" + type(exc).__name__ + ")"
                     if breach or time.monotonic() > deadline:
-                        stop_container(proc, name)
+                        stop()
                         record["exit_code"] = proc.returncode
                         if breach:
                             record["error"] = "output limit exceeded: " + breach
@@ -718,8 +891,12 @@ def run_arm(app, plan, image, experiment, run_dir, arm):
                             record["timed_out"] = True
                         break
             except BaseException:  # KeyboardInterrupt and the like must not leave a running container without a watchdog
-                stop_container(proc, name)
+                if write_fd is not None:
+                    stop()
                 raise
+            finally:
+                if write_fd is not None:
+                    os.close(write_fd)
     except OSError as exc:
         record["error"] = str(exc)
     if not record["error"]:  # the last write can land between the final poll and the exit
@@ -761,9 +938,14 @@ def score(plan, arms):
         delta = None
         met = False
         if number(base) and number(cand):
-            delta = (cand - base) if spec["direction"] == "increase" else (base - cand)
+            delta_decimal = (Fraction(str(cand)) - Fraction(str(base)) if spec["direction"] == "increase"
+                             else Fraction(str(base)) - Fraction(str(cand)))
+            try:
+                delta = delta_decimal.numerator if delta_decimal.denominator == 1 else float(delta_decimal)
+            except OverflowError:
+                delta = None
             delta = delta if number(delta) else None
-            met = delta is not None and delta >= spec["min_delta"]
+            met = delta is not None and delta_decimal >= Fraction(str(spec["min_delta"]))
         guards = []
         for guard in spec["guards"]:
             actual = next((c["actual"] for c in checks if c["metric"] == guard["metric"] and c["arm"] == "candidate"), None)
@@ -773,9 +955,32 @@ def score(plan, arms):
                 continue
             ok = number(actual) and (actual <= guard["value"] if guard["op"] == "le" else actual >= guard["value"])
             guards.append({**guard, "actual": actual, "passed": bool(ok)})
-        benefit = {"metric": spec["metric"], "delta": delta, "min_delta": spec["min_delta"], "guards": guards,
+        benefit = {"metric": spec["metric"], "delta": delta,
+                   "delta_exact": str(delta_decimal) if number(base) and number(cand) else None,
+                   "min_delta": spec["min_delta"], "guards": guards,
                    "met": bool(reproduced and met and all(g["passed"] for g in guards))}
     return checks, reproduced, benefit
+
+
+def interrupted_attempt(run):
+    return {**run, "status": "INTERRUPTED", "reason": "Previous runner stopped without completion",
+            "reproduced": False, "benefit": None}
+
+
+def recover_attempts(app, job_id):
+    """Called under the workspace writer lock, which has no other active runner."""
+    for run in app.store.list("run", insertion_order=True):
+        if run["job_id"] == job_id and run.get("status") == "RUNNING":
+            name = run.get("active_container")
+            if name:
+                expected = {"p2p-" + run["id"] + "-" + arm for arm in ARMS}
+                if name not in expected:
+                    raise ValueError("Interrupted run has an invalid container identity")
+                try:
+                    remove_container(name)
+                except CleanupPending as exc:
+                    raise ValueError(str(exc)) from exc
+            app.store.save("run", run["id"], {**interrupted_attempt(run), "recovered_at": now()})
 
 
 def run_experiment(app, job_id, experiment_id):
@@ -787,20 +992,21 @@ def run_experiment(app, job_id, experiment_id):
         raise ValueError("Experiment belongs to another job")
     if experiment.get("analysis") != job["analysis"]:
         raise ValueError("Experiment was registered under a different analysis; register it again")
+    recover_attempts(app, job_id)
     plan = app.store.json(experiment["plan"])
     run = {"id": unique("run"), "experiment_id": experiment_id, "job_id": job_id, "started_at": now(),
            "plan": experiment["plan"], "source_tree": experiment["source_tree"], "input_tree": experiment["input_tree"]}
+    app.store.save("run", run["id"], {**run, "status": "RUNNING", "arms": {}, "checks": []})
     try:
-        if tree_hash(experiment["source_path"]) != experiment["source_tree"]:
-            raise ValueError("Source tree changed since registration")
-        if experiment["input_path"] and tree_hash(experiment["input_path"]) != experiment["input_tree"]:
-            raise ValueError("Input tree changed since registration")
-        run["image_id"] = image_id(plan["image"])
-    except (ValueError, OSError) as exc:
-        run.update(status="BLOCKED", reason=str(exc), arms={}, checks=[], reproduced=False, benefit=None)
-        return app.store.save("run", run["id"], run)
-    try:
-        app.store.save("run", run["id"], {**run, "status": "RUNNING", "arms": {}, "checks": []})
+        try:
+            if tree_hash(experiment["source_path"]) != experiment["source_tree"]:
+                raise ValueError("Source tree changed since registration")
+            if experiment["input_path"] and tree_hash(experiment["input_path"]) != run["input_tree"]:
+                raise ValueError("Input tree changed since registration")
+            run["image_id"] = image_id(plan["image"])
+        except (ValueError, OSError) as exc:
+            run.update(status="BLOCKED", reason=str(exc), arms={}, checks=[], reproduced=False, benefit=None)
+            return app.store.save("run", run["id"], run)
         run_dir = app.store.root / "runs" / run["id"]
         run_dir.mkdir(mode=0o700)
         for arm in ARMS:  # separate fresh container per arm
@@ -812,19 +1018,24 @@ def run_experiment(app, job_id, experiment_id):
             record["result"] = None if keep is None else app.store.put_json(keep)
             arms[arm] = record
             app.store.save("run", run["id"], {**run, "status": "RUNNING", "arms": dict(arms), "checks": []})
-        sealed = app.store.put_json({arm: {k: rec[k] for k in SEALED} for arm, rec in arms.items()})
+        sealed = app.store.put_json({"schema": 2, "run": run_identity(run),
+                                     "arms": {arm: {k: rec[k] for k in SEALED} for arm, rec in arms.items()}})
         saved = app.store.save("run", run["id"], {**run, "arms": arms, "sealed": sealed, "finished_at": now(), "status": "FAIL"})
         verdict = evaluate(app, saved)
         return app.store.save("run", run["id"], {**saved, **{k: verdict[k] for k in ("checks", "reproduced", "benefit", "status")}})
+    except CleanupPending as exc:
+        pending = app.store.get("run", run["id"])
+        app.store.save("run", run["id"], {**pending, "reason": str(exc)})
+        raise ValueError(str(exc)) from exc
     except (KeyboardInterrupt, SystemExit):
         completed = app.store.get("run", run["id"]).get("arms", {})
         app.store.save("run", run["id"], {**run, "status": "INTERRUPTED", "reason": "Execution was interrupted",
-                                         "arms": completed, "checks": [], "reproduced": False, "benefit": None})
+                                         "arms": completed, "checks": [], "reproduced": False, "benefit": None,
+                                         "finished_at": now()})
         raise
-    except Exception as exc:  # preserve any arm already measured before a failure
+    except Exception as exc:  # the attempt must stay on record even when bookkeeping fails
         completed = app.store.get("run", run["id"]).get("arms", {})
-        run.update(status="FAIL", reason=f"Run bookkeeping failed ({type(exc).__name__}): {exc}",
-                   arms=completed, checks=[], reproduced=False, benefit=None)
+        run.update(status="FAIL", reason=f"Run bookkeeping failed ({type(exc).__name__}): {exc}", arms=completed, checks=[], reproduced=False, benefit=None)
         return app.store.save("run", run["id"], run)
 
 
@@ -836,76 +1047,159 @@ def stale_reason(experiment, run, app=None):
             return "input changed after the run"
     except (ValueError, OSError) as exc:
         return str(exc)
-    if app is not None and run.get("image_id"):  # evidence belongs to the exact image that produced it
+    if app is not None and run.get("image_id"):
         try:
             current = image_id(app.store.json(experiment["plan"])["image"])
         except ValueError:
-            return None  # cannot be checked here (no runtime/image): reported by image_unverified, not treated as a change
+            return None
         if current != run["image_id"]:
             return "container image changed after the run"
     return None
 
 
-def image_unverified(experiment, run, app):
-    """Why the image identity of a stored run could not be re-checked on this host, or None."""
-    if run and run.get("image_id"):
+def current_runs(app, experiment, *, historical=False):
+    history = runs(app, experiment["id"])
+    if not history:
+        return history
+    if any(run["status"] == "RUNNING" for run in history):
         try:
-            image_id(app.store.json(experiment["plan"])["image"])
+            with app.store.idle_writer():
+                history = [interrupted_attempt(run) if run["status"] == "RUNNING" else run
+                           for run in runs(app, experiment["id"])]
+        except WorkspaceBusy:
+            pass
+    snapshot_reason = ("analysis changed after the experiment was registered" if historical
+                       else stale_reason(experiment, experiment))
+    current_image, unverified = None, None
+    if not historical and any(run.get("image_id") for run in history):
+        try:
+            current_image = image_id(app.store.json(experiment["plan"])["image"])
         except ValueError as exc:
-            return str(exc)
-    return None
+            unverified = str(exc)
+    for index, run in enumerate(history):
+        reason = snapshot_reason
+        if not reason and current_image and run.get("image_id") and run["image_id"] != current_image:
+            reason = "container image changed after the run"
+        history[index] = {**run, "score_status": run["status"], "status": "STALE" if reason else run["status"],
+                          "reason": reason or run.get("reason"), "image_unverified": unverified if run.get("image_id") else None}
+    return history
 
 
-def outcome_for_job(app, job):
+def outcome_for_job(app, job, run_histories=None):
     rows = []
     analysis = app.store.json(job["analysis"]) if job["analysis"] else None
-    review = app.store.json(job["review"]) if job["review"] else None
-    registered = {e["id"] for e in experiments(app, job["id"])}
-    # the review covers the analysis it names and the experiment plans that existed when it was recorded
-    reviewed = bool(review) and review["decision"] == "pass" and review["analysis"] == job["analysis"] \
-        and registered <= set(review.get("experiments", []))
+    registered = experiments(app, job["id"])
     for project in job["projects"]:
         pid = project["id"]
+        project_experiments = [e for e in registered if e["project_id"] == pid]
         assessment = next((a for a in analysis["assessments"] if a["project_id"] == pid), None) if analysis else None
-        listed, latest = [], []
-        for experiment in (e for e in experiments(app, job["id"]) if e["project_id"] == pid):
-            history = runs(app, experiment["id"])
+        scoped, scoped_support = [], set()
+        if assessment and assessment["relevance"] == "findings_only":
+            reviews = job.get("finding_reviews", {}).get(pid, {})
+            for row in assessment["findings"]:
+                key = reviews.get(row["id"])
+                item_review = app.store.json(key) if key else None
+                bindings = (test_binding(e) for e in project_experiments
+                          if e.get("analysis") == job["analysis"] and e.get("finding_id") == row["id"])
+                if item_review and item_review["evidence"] != evidence_key(
+                        job["id"], project, job["analysis"], row["id"], bindings, job.get("analysis_author")):
+                    item_review, key = None, None
+                scoped_support.update(supported_tests(row, item_review))
+                scoped.append({"id": row["id"], "target": row["target"], "proposed": row["proposed"],
+                               "status": "STALE" if job["stale"] else finding_status(row, item_review), "review_hash": key,
+                               "premise_review": item_review["premise"] if item_review else None,
+                               "test_links": {eid: review["test_link"] for eid, review in
+                                              (item_review or {}).get("test_reviews", {}).items()}})
+        scoped_reviewed = bool(scoped) and all(item["status"].startswith("REVIEWED_") for item in scoped)
+        key = job.get("reviews", {}).get(pid)
+        review = app.store.json(key) if key else None
+        listed, attempts, scope = [], [], []
+        for experiment in project_experiments:
+            active = experiment.get("analysis") == job["analysis"]
+            history = (current_runs(app, experiment, historical=not active) if run_histories is None
+                       else run_histories[experiment["id"]])
             run = history[-1] if history else None
-            stale = stale_reason(experiment, run, app) if run else None
-            if experiment.get("analysis") != job["analysis"]:
-                stale = "analysis changed after the experiment was registered"
+            stale = None if active else "analysis changed after the experiment was registered"
+            if active:
+                scope.append({"id": experiment["id"], "plan_hash": experiment["plan"], "runs": history,
+                              "source_tree": experiment["source_tree"], "input_tree": experiment["input_tree"],
+                              "reference_sha256": experiment.get("reference_sha256")})
             status = "NOT_RUN" if run is None and not stale else "STALE" if run is None else ("STALE" if stale else run["status"])
-            listed.append({"id": experiment["id"], "kind": experiment["kind"], "status": status, "runs": len(history),
+            listed.append({"id": experiment["id"], "kind": experiment["kind"], "status": status, "runs": len(history), "current_analysis": active,
                            "run_id": run and run["id"], "reason": stale or (run or {}).get("reason"),
-                           "image_unverified": image_unverified(experiment, run, app)})
-            latest.append((experiment["kind"], status, run))
-        statuses = {s for _, s, _ in latest}
+                           "image_unverified": (run or {}).get("image_unverified"),
+                           "head_matches": bool(experiment.get("head_matches")),
+                           "run_statuses": [item["status"] for item in history],
+                           "finding_id": experiment.get("finding_id"), "oracle_sha256": experiment.get("oracle_sha256"),
+                           "reference_sha256": experiment.get("reference_sha256")})
+            if active:
+                attempts.extend((experiment["kind"], item["status"], item) for item in history)
+                if not history:
+                    attempts.append((experiment["kind"], status, None))
+        applicable_review = bool(review and review["analysis"] == job["analysis"] and
+                                 review.get("evidence") == app.store.evidence_digest(pid, job["analysis"], scope, job_id=job["id"],
+                                                                           research_snapshot=job["research"]["snapshot"],
+                                                                           project_snapshot=project["snapshot"],
+                                                                           author=job.get("analysis_author")))
+        reviewed = bool(not job["stale"] and applicable_review and review["decision"] == "pass")
+        statuses = {s for _, s, _ in attempts}
         if job["stale"]:
             decision, why = "STALE", "Project or research memory changed after this job was created; evidence applies only to the tested snapshots."
         elif assessment is None:
             decision, why = "NO_ANALYSIS", "No grounded analysis has been submitted."
-        elif assessment["relevance"] == "not_applicable":
-            decision, why = "NOT_APPLICABLE", "Analysis found the research not applicable to this project."
-        elif not listed:
+        elif review and review["decision"] == "revise" and (applicable_review or (review.get("evidence") is None and review["analysis"] == job["analysis"])):
+            decision, why = "ANALYSIS_REVIEW_REQUIRED", "A reviewer requested changes to the analysis for this project."
+        elif assessment["relevance"] == "not_applicable" and not attempts:
+            if reviewed:
+                decision, why = "NOT_APPLICABLE", "The recorded project-specific review accepted the applicability rejection."
+            else:
+                decision, why = "APPLICABILITY_PENDING_REVIEW", "The analysis proposes not applicable; the decision needs project-specific review."
+        elif not attempts and assessment["relevance"] == "findings_only":
+            if scoped_reviewed:
+                decision, why = "FINDINGS_REVIEWED", "Each finding has a recorded scoped review. Project benefit was not established."
+            else:
+                decision, why = "FINDINGS_PENDING_REVIEW", "One or more findings await evidence or scoped semantic review."
+        elif assessment["relevance"] == "needs_evidence":
+            decision, why = "NEEDS_PROJECT_EVIDENCE", "The assessment records missing evidence for the project. Resolve or review those gaps before claiming benefit."
+        elif not attempts and listed:
+            decision, why = "STALE_EVIDENCE", "Prior experiments are historical; register a plan for the current analysis."
+        elif not attempts:
             decision, why = "ANALYSIS_ONLY", "Text analysis only; no experiment supports applicability, so this is not a verified recommendation."
         elif statuses == {"PASS"}:
-            benefit_runs = [r for k, _, r in latest if k == "project_benefit"]
+            benefit_runs = [r for k, _, r in attempts if k == "project_benefit"]
             met = bool(benefit_runs) and all(r["benefit"]["met"] for r in benefit_runs)
+            benefit_ids = {r["experiment_id"] for r in benefit_runs}
+            attested = reviewed and benefit_ids <= set(review.get("verified_experiments", []))
             if not met:
                 decision, why = "REPRODUCED_BENEFIT_UNPROVEN", "The source reproduced as declared, but not every project_benefit experiment met its declared criteria (or none exists). Reproduction does not prove utility."
+            elif assessment["relevance"] == "findings_only" and not (attested and benefit_ids <= scoped_support):
+                decision = "FINDINGS_REVIEWED" if scoped_reviewed else "FINDINGS_PENDING_REVIEW"
+                why = "A project-level passing experiment does not establish benefit for individual findings."
+            elif assessment["relevance"] == "not_applicable":
+                decision, why = "APPLICABILITY_CONFLICT", "The declared benefit passed and conflicts with the analysis rejection; revise the assessment before drawing a conclusion."
+            elif attested:
+                decision, why = "BENEFIT_DEMONSTRATED", "The benefit met its declared criteria and the reviewer attested to the method, target data and independent reference for every benefit experiment."
             elif reviewed:
-                decision, why = "BENEFIT_DEMONSTRATED", "Every experiment passed, an independently checked project_benefit experiment met its declared criteria on the declared inputs, and the analysis review passed."
+                decision, why = "BENEFIT_CRITERIA_MET", "The measurements met the declared thresholds. A reviewer must verify each benefit experiment's method, target data and frozen independent reference to establish benefit."
             else:
-                decision, why = "BENEFIT_PENDING_REVIEW", "The benefit criteria were met on the declared inputs, but the analysis has no passing independent review that covers the analysis and every registered experiment plan (review again after adding experiments)."
+                decision, why = "BENEFIT_PENDING_REVIEW", "The benefit criteria were met on the declared inputs. A passing review must cover this project's analysis, plans and recorded runs."
         elif "PASS" in statuses:
             decision, why = "MIXED_EVIDENCE", "Some experiments passed while others failed, are stale, blocked or not run; no clean conclusion is possible."
         elif "STALE" in statuses:
             decision, why = "STALE_EVIDENCE", "Source or inputs changed after the run; re-run the experiment."
         elif "FAIL" in statuses:
             decision, why = "EXPERIMENT_FAILED", "At least one experiment ran and failed its declared checks."
+        elif "INTERRUPTED" in statuses or "RUNNING" in statuses:
+            decision, why = "EXPERIMENT_INCOMPLETE", "An experiment attempt started without a completed comparison."
         elif "BLOCKED" in statuses:
             decision, why = "EXPERIMENT_BLOCKED", "Execution was blocked (missing runtime, image or changed inputs); see the run reason."
         else:
             decision, why = "EXPERIMENT_NOT_RUN", "Experiments are registered but have not been run."
-        rows.append({"project_id": pid, "decision": decision, "explanation": why, "experiments": listed})
+        result = {"project_id": pid, "decision": decision, "explanation": why, "experiments": listed,
+                  "relevance": assessment["relevance"] if assessment else None, "review_current": reviewed}
+        if scoped:
+            for item in scoped:
+                item["experiments"] = [x["id"] for x in listed if x["current_analysis"] and x["finding_id"] == item["id"]]
+            result["findings"] = scoped
+        rows.append(result)
     return rows

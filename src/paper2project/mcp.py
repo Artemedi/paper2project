@@ -13,7 +13,7 @@ import sys
 from . import __version__
 
 PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")
-S, I, O, A = "string", "integer", "object", "array"
+S, I, O, A, B = "string", "integer", "object", "array", "boolean"
 
 
 def tool(name, description, properties, required, call, *, readonly=False, gate=None):
@@ -26,7 +26,7 @@ def tool(name, description, properties, required, call, *, readonly=False, gate=
 def tools(app):
     return [
         tool("projects", "List imported project snapshots.", {}, [], lambda a: app.store.list("project"), readonly=True),
-        tool("research", "List imported research snapshots with coverage status.", {}, [], lambda a: app.store.list("research"), readonly=True),
+        tool("research", "List imported research snapshots with coverage status.", {}, [], lambda a: app.research(), readonly=True),
         tool("project_import", "Import a project Markdown file or a directory of project memories (inside an allowed root).",
              {"path": S, "layout": S, "name": S, "project_id": S}, ["path"],
              lambda a: app.import_projects(a["path"], a.get("layout", "auto"), a.get("name"), a.get("project_id"))),
@@ -40,11 +40,16 @@ def tools(app):
              {"job_id": S, "query": S, "max_chars": I}, ["job_id"], lambda a: app.context(a["job_id"], a.get("query", ""), a.get("max_chars", 100000)), readonly=True),
         tool("document_read", "Read a line range of one document in the job.", {"job_id": S, "document_id": S, "start": I, "count": I},
              ["job_id", "document_id"], lambda a: app.read(a["job_id"], a["document_id"], a.get("start", 1), a.get("count", 80)), readonly=True),
-        tool("analysis_submit", "Submit grounded per-project assessments with exact document/line/quote citations.", {"job_id": S, "analysis": O},
-             ["job_id", "analysis"], lambda a: app.submit_analysis(a["job_id"], a["analysis"])),
-        tool("analysis_review", "Record an independent review (pass/revise); `analysis` is the analysis hash from job_status and the review covers the experiments registered so far.",
-             {"job_id": S, "decision": S, "notes": S, "reviewer": S, "analysis": S}, ["job_id", "decision", "notes", "reviewer", "analysis"],
-             lambda a: app.review_analysis(a["job_id"], a["decision"], a["notes"], a["reviewer"], a["analysis"]), gate="review"),
+        tool("analysis_submit", "Submit grounded per-project assessments with exact citations.", {"job_id": S, "analysis": O, "author": S},
+             ["job_id", "analysis"], lambda a: app.submit_analysis(a["job_id"], a["analysis"], a.get("author"))),
+        tool("review_packet", "View one project's assessment, plans, run results and evidence hash.",
+             {"job_id": S, "project_id": S, "blind": B}, ["job_id"],
+             lambda a: app.review_packet(a["job_id"], a.get("project_id"), blind=a.get("blind", False)), readonly=True),
+        tool("analysis_review", "Record a project review. Final verdicts require the current evidence hash from review_packet.",
+             {"job_id": S, "decision": S, "notes": S, "reviewer": S, "analysis": S, "project_id": S, "evidence": S, "verified_experiments": A},
+             ["job_id", "decision", "notes", "reviewer", "analysis"],
+             lambda a: app.review_analysis(a["job_id"], a["decision"], a["notes"], a["reviewer"], a["analysis"],
+                                           a.get("project_id"), a.get("evidence"), a.get("verified_experiments")), gate="review"),
         tool("experiment_add", "Register a source-bound experiment plan (see docs for the schema).", {"job_id": S, "plan": O}, ["job_id", "plan"],
              lambda a: app.add_experiment(a["job_id"], a["plan"])),
         tool("experiment_run", "Run baseline and candidate in separate offline containers and score them on the host.",
@@ -54,7 +59,7 @@ def tools(app):
     ]
 
 
-TYPES = {S: str, I: int, O: dict, A: list}
+TYPES = {S: str, I: int, O: dict, A: list, B: bool}
 
 
 def check(schema, args):
@@ -83,7 +88,8 @@ def handle(request, app, listing, allow_execution, allow_network, allow_review=F
     elif method == "ping":
         result = {}
     elif method == "tools/list":
-        result = {"tools": [{k: v for k, v in t.items() if k not in {"call", "gate"}} for t in listing]}
+        result = {"tools": [{k: v for k, v in t.items() if k not in {"call", "gate"}} for t in listing
+                            if t["gate"] != "review" or allow_review]}
     elif method == "tools/call":
         entry = next((t for t in listing if t["name"] == params.get("name")), None)
         try:

@@ -68,12 +68,24 @@ def parser():
     s = sub.add_parser("submit-analysis", help="submit an analysis JSON file written by a human or agent")
     s.add_argument("job_id")
     s.add_argument("file")
+    s.add_argument("--author", help="Declared analysis author")
     s = sub.add_parser("review")
     s.add_argument("job_id")
     s.add_argument("--decision", choices=["pass", "revise"], required=True)
     s.add_argument("--notes", required=True)
     s.add_argument("--reviewer", required=True)
-    s.add_argument("--analysis", required=True, help="analysis hash shown by `report`/job status; the review covers that analysis and the experiments registered so far")
+    s.add_argument("--analysis", required=True, help="Analysis hash from review-packet")
+    s.add_argument("--project", help="Project id (required for multi-project jobs)")
+    s.add_argument("--evidence", help="Evidence hash from review-packet; required to finalize a verdict")
+    s.add_argument("--verify-experiment", action="append", help="Attest an experiment's method, data and frozen independent reference")
+    s = sub.add_parser("review-packet", help="show a project's assessment, plans and run results")
+    s.add_argument("job_id")
+    s.add_argument("--project", help="Project id (required for multi-project jobs)")
+    s.add_argument("--blind", action="store_true", help="Omit proposals and run results from a scoped finding packet")
+    s = sub.add_parser("review-finding", help="record a scoped premise and test-link review from JSON")
+    s.add_argument("job_id")
+    s.add_argument("file")
+    s.add_argument("--project", help="Project id (required for multi-project jobs)")
 
     ex = sub.add_parser("experiment").add_subparsers(dest="action", required=True)
     s = ex.add_parser("add")
@@ -135,7 +147,7 @@ def run(args):
             return app.attach_asset(args.project_id, args.path, args.name)
         return app.store.list("project")
     if c == "research":
-        return app.import_research(args.source, args.title, args.id, args.origin) if a == "import" else app.store.list("research")
+        return app.import_research(args.source, args.title, args.id, args.origin) if a == "import" else app.research()
     if c == "job":
         if a == "create":
             return app.create_job(args.research, args.project)
@@ -153,9 +165,13 @@ def run(args):
         print(f"Sending snapshot text to {endpoint.host} (model {endpoint.model})", file=sys.stderr)
         return model.analyze(app, args.job_id, endpoint, args.query)
     if c == "submit-analysis":
-        return app.submit_analysis(args.job_id, json.loads(Path(args.file).read_text()))
+        return app.submit_analysis(args.job_id, json.loads(Path(args.file).read_text()), args.author)
     if c == "review":
-        return app.review_analysis(args.job_id, args.decision, args.notes, args.reviewer, args.analysis)
+        return app.review_analysis(args.job_id, args.decision, args.notes, args.reviewer, args.analysis, args.project, args.evidence, args.verify_experiment)
+    if c == "review-packet":
+        return app.review_packet(args.job_id, args.project, blind=args.blind)
+    if c == "review-finding":
+        return app.review_finding(args.job_id, args.project, json.loads(Path(args.file).read_text()))
     if c == "experiment":
         if a == "add":
             return app.add_experiment(args.job_id, json.loads(Path(args.plan).read_text()))

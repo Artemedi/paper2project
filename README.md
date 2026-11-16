@@ -70,6 +70,7 @@ rejects an invalid quotation and verifies that the default export omits raw proj
 | 🔴 `EXPERIMENT_BLOCKED` / `EXPERIMENT_FAILED` | Execution was blocked or the experiment failed. | Inspect the report and run `doctor` if the environment is blocked. |
 | 🟡 `REPRODUCED_BENEFIT_UNPROVEN` | The expected observations match. A benefit comparison is missing or a benefit criterion failed. | Identify the missing comparison or the failed criterion. |
 | 🟣 `BENEFIT_PENDING_REVIEW` | The measured benefit meets the declared criteria. | Send the evidence to a separate reviewer. |
+| 🟡 `BENEFIT_CRITERIA_MET` | The declared thresholds passed. | Verify the method, target data and frozen reference for each benefit experiment. |
 | 🟢 `BENEFIT_DEMONSTRATED` | The comparison and independent review passed on the declared inputs. | Assess whether those inputs are representative before adopting the change. |
 
 > [!TIP]
@@ -93,7 +94,7 @@ rejects an invalid quotation and verifies that the default export omits raw proj
 | [CLI and MCP guide](docs/product/README.md) | Configure a local workspace, import a PDF or register an experiment plan. |
 | [KVSET demo](examples/kvset-demo/run_demo.py) | Try original author code on synthetic cache traces. |
 | [Product scope](docs/product/PRODUCT.md) | Check supported workflows and their evidence limits. |
-| [Release notes](docs/RELEASE-NOTES-1.0.1.md) | See changes in the current release. |
-| [Original Paper2Agent adapter](https://github.com/jmiao24/Paper2Agent) | Reproduce the earlier paper-processing workflow. |
+| [Release notes](docs/RELEASE-NOTES-1.0.2.md) | See changes in the current release. |
+| [Original Paper2Agent adapter](https://github.com/Artemedi/dsh-paper2agent/blob/main/docs/USAGE.md) | Reproduce the earlier paper-processing workflow. |
 
 [MIT license](LICENSE) · [Third-party notices](NOTICE.md) · [Original Paper2Agent MIT notice](licenses/Paper2Agent-MIT.txt)

@@ -10,12 +10,14 @@ Two ways to drive it, one implementation:
 - **Standalone mode**: `paper2project analyze` asks an OpenAI-compatible Chat Completions endpoint you configure.
 
 Requirements: Python 3.11+. Optional: `pypdf` (`pip install '.[pdf]'`) to import PDFs; rootless Podman and a
-local container image to run experiments. Linux x86_64 is the tested platform.
+local container image to run experiments. Linux x86_64 is the tested platform. Native Windows
+workspace commands require a Unix filesystem lock and are unsupported. Run under Linux in WSL
+with the workspace on the Linux filesystem if using a Windows machine. WSL execution has not been qualified.
 
 ## Install and check
 
 ```bash
-unzip paper2project-1.0.1.zip && cd paper2project-1.0.1
+unzip paper2project-1.0.2.zip && cd paper2project-1.0.2
 python3 -m venv .venv && .venv/bin/pip install .          # or: PYTHONPATH=src python3 -m paper2project ...
 .venv/bin/paper2project selftest                           # offline, no container, no model
 .venv/bin/paper2project doctor                             # shows container runtime / PDF support
@@ -33,10 +35,11 @@ paper2project research import ./paper.pdf --title "Paper"  # .md/.txt/.pdf/https
 paper2project job create --research paper --project my-app --project other-app
 paper2project job context JOB                              # line-numbered, citable chunks (untrusted data)
 paper2project analyze JOB --base-url https://HOST/v1 --model NAME --yes-send   # standalone mode
-#   or: paper2project submit-analysis JOB analysis.json     # analysis written by you or an agent
-paper2project review JOB --decision pass --notes "..." --reviewer "name" --analysis ANALYSIS_HASH   # hash from `report` JSON / job status
+#   or: paper2project submit-analysis JOB analysis.json --author "analyst"
 paper2project experiment add JOB plan.json
 paper2project experiment run JOB EXPERIMENT
+paper2project review-packet JOB --project my-app
+paper2project review JOB --project my-app --decision pass --notes "..." --reviewer "reviewer" --analysis ANALYSIS_HASH --evidence EVIDENCE_HASH
 paper2project report JOB                                   # Markdown (or --format json)
 paper2project export JOB out.zip                           # report + manifest; --include-memory adds private text
 ```
@@ -48,16 +51,89 @@ to run experiments until you create a new job.
 ### Analysis format
 
 One assessment per selected project. Each cites at least one passage of the research and one of that
-project (`document_id` from `job context`, 1-based line range, and a required exact `quote` of at least 8 characters inside it).
-`relevance` is `candidate`, `not_applicable` or `needs_evidence`. Citations are checked mechanically;
-they prove the text exists, not that the reasoning is right, so use `review` with an independent reviewer.
+project (`document_id` from `job context`, the exact line range and a verbatim `quote` of 8–2,000 characters
+across at most 12 lines). PDF page headings inserted by the extractor and citations to other projects
+are refused. `relevance` is `candidate`, `not_applicable` or `needs_evidence`. An applicability
+rejection needs a current project review. A submitted rejection still permits registering a test.
+Citations are checked mechanically. Use the adjacent source lines and an independent review to assess support.
+
+### Scoped findings (experimental)
+
+When several ideas apply to different components of one project, submit `finding_schema: 1`
+and a `findings` array in the assessment instead of a project-level `relevance` label.
+Keep the assessment rationale and research/project citations. Each finding needs a unique
+`id`, `target`, `claim`, `premise`, `falsifier`, `proposed` and `research_citations`.
+The proposal can be `candidate`, `not_applicable`, `already_implemented` or `needs_evidence`.
+
+Attach the minimal readable project artifact before creating the job. A finding's
+`project_artifacts` references include `name`, `sha256`, `start`, `end` and an exact `quote`.
+Without a matching attachment, omit the reference and name the evidence gap in
+`missing_evidence`. The app validates the declared attachment and span against the job's
+snapshot. It reports `NEEDS_EVIDENCE` or `PENDING_SEMANTIC_REVIEW` per finding in both formats.
+Use those per-finding values when filtering the report.
+
+The review packet retains the local attachment anchor. A portable export of that reference
+retains its hash and span and omits its name and quote. The export includes current scoped
+judgments and their bindings in `finding-reviews.json` when available. The projection omits
+reviewer names, notes, independence rationale, and attachment names and quotes. Inspect any
+other authored text before sharing.
+
+Use `submit-analysis --author` to record the analyst. A separate reviewer reads the
+`paper2project review-packet JOB --project PROJECT --blind` packet and runs
+`paper2project review-finding JOB review.json --project PROJECT`.
+The JSON names `finding_id`, its `evidence` token from `finding_evidence`, the `reviewer`,
+`notes`, the `premise` judgment (`supported`, `contradicted` or `unknown`) and the
+`test_link` judgment (`relevant`, `irrelevant` or `unknown`). For a definite judgment
+include the `experiment_id` from the test binding. Each experiment can have its own
+judgment. The binding includes the plan and the frozen source and input trees. Use
+`unknown` for a review limited to the premise. To reach a reviewed
+disposition, include `second_observation` using the same anchor fields as an artifact
+reference but pointing to a different attached artifact and a different quote. Explain in
+`independence_basis` how that observation can disagree with the original evidence.
+
+The app records whether the reviewer supported applicability, contradicted the premise,
+or rejected the test link. Its checks bind the assessment and both evidence anchors.
+Reviewers judge whether the observations are substantively independent and relevant.
+Declared names establish attribution only. A finding's test-link review establishes
+whether the test measures the finding. A scoped experiment also needs passing measured
+criteria and a benefit review with a frozen reference to support demonstrated benefit.
+
+Give the reviewer only the blind packet at the first stage. It shows source context,
+the claims, their premises, exact project anchors, declared data and comparison, and planned
+metric names. It omits the author's proposals, expected-value fields and run outcomes.
+Keep expected outcomes and run results out of the free-text provenance. It controls presentation only.
+Someone with the full workspace can read the complete report.
+
+For an experiment on a scoped analysis, set `finding_id` and provide
+`provenance: {oracle, data, comparison}`. The oracle is an exact anchor in a frozen
+project attachment. Describe the input scope and the difference between the two
+approaches in `data` and `comparison`. Register plans before the reviewer signs a
+finding. Adding a bound plan invalidates that finding's earlier review. The report
+lists which attempts belong to each finding and the oracle digest. Human review
+judges whether the oracle and input scope support the measurements.
+
+### Importing a qualified Paper2Agent package
+
+From the adapter checkout, run `PYTHONPATH=src python3 tools/p2a.py handoff PAPER_ID --workspace WORKSPACE`.
+The adapter checks current qualification, then imports the verified text and binds the original
+source hashes, review fingerprint, coverage and limitations to the product snapshot. The research
+list, job context and report expose the coverage. Portable reports carry the qualification
+metadata. The qualification includes the exact review and manifest digests and resolves
+the origin from the reviewed source manifest. The adapter captures qualification metadata
+once and the product checks it against the imported bytes before recording coverage.
+Original source files stay in the local store. Older handoffs without those digests display
+`PAPER2AGENT_LEGACY_REVIEW_UNVERIFIED`. Repeat the handoff against current qualified
+evidence to restore verified coverage. Generic imports retain their extraction
+or unattested coverage status.
 
 ### Standalone model mode
 
 `--base-url` and `--model` are required (nothing is assumed). The API key is read from the environment
 variable named by `--key-env` (default `PAPER2PROJECT_API_KEY`); it is never stored, logged or exported.
 The command sends project and research text to that endpoint, so it refuses to run without `--yes-send`.
-Rejected analyses are returned to the model with the validation error (3 attempts), never auto-accepted.
+Rejected analyses are returned to the model with the validation error (3 attempts). If the local context budget
+would omit chunks, standalone analysis stops before contacting the model. Read the missing material with MCP
+`document_read` or prepare and submit an analysis locally.
 
 ### Host-agent (MCP) mode
 
@@ -70,8 +146,9 @@ Imports are limited to `--allow-root` directories (none given: all local imports
 `--allow-network`; container experiments need `--allow-execution`; `analysis_review` needs `--allow-review`, which is off by
 default so an agent confined to MCP cannot approve itself (use `paper2project review` from a separate session or person). This is
 a gate on the MCP channel only: an agent with shell access to the same workspace can still run the CLI and name any reviewer, so the
-review is a record of a human or separate-session decision, not a cryptographic proof of independence. Tools: `projects`, `research`, `project_import`,
-`research_import`, `job_create`, `job_status`, `job_context`, `document_read`, `analysis_submit`, `analysis_review`,
+review records a declared human or separate-session identity. Keep analysis and review permissions separate.
+An explicitly matching analyst and reviewer name is refused. Tools: `projects`, `research`, `project_import`,
+`research_import`, `job_create`, `job_status`, `job_context`, `document_read`, `analysis_submit`, `review_packet`, `analysis_review`,
 `experiment_add`, `experiment_run`, `experiments`, `report`. This project does not edit any client configuration.
 
 ## Experiments: reproduction versus project benefit
@@ -102,12 +179,23 @@ the run from an independent source** (hand calculation, published table, other i
   commands, numeric independently expected values for both arms, `min_delta > 0`, a benefit-metric tolerance below half of
   `min_delta`, and at least one quality/cost guard on a different metric. Every `project_benefit` experiment of a project must
   meet its criteria for a benefit claim.
-  Benefit is demonstrated only if every check passes and the analysis has a passing independent `review` that names the current
-  analysis hash and was recorded after every registered experiment plan (adding an experiment later leaves the claim at
-  `BENEFIT_PENDING_REVIEW` until reviewed again). Show the reviewer the plans, sources and expected values, not just the prose.
-  The input directory must contain data, and two metrics may not read the same result path.
-- A `.git` directory in the source is compared with the declared revision (read without running git, regular files inside
-  `.git` only); without one, the revision is recorded as unverified (`head_matches: false`). `head_matches: true` only
+  A passing project review without reference verification records `BENEFIT_CRITERIA_MET`.
+  To support `BENEFIT_DEMONSTRATED`, attach the independent reference as project evidence and
+  create the job against that snapshot. Name the attachment in the plan's `reference` field.
+  The JSON attachment contains `schema: 1`, a `method` describing how the values were
+  obtained, `source_tree` and `input_tree` SHA-256 digests, and `expected` keyed by metric
+  name with the exact per-arm values from the plan. Use `paper2project.execution.tree_hash(path)["sha256"]`
+  to compute tree digests. A declared Git revision must match the source's HEAD. Standalone checkouts and
+  standard linked Git worktrees are supported. A linked checkout's administrative
+  directory must be within the allowed roots and point back to that checkout; its
+  common Git directory must also be allowed. Redirected or inaccessible metadata
+  cannot support reference attestation.
+  A separate reviewer checks the intervention, target data and whether the values
+  came from an independent reference. In CLI review use `--verify-experiment EXP_ID`
+  for each verified benefit experiment, together with the current analysis and evidence
+  hashes from `review-packet`. Names record declared attribution. Adding a plan or
+  run requires a current review. In multi-project jobs, review each project separately.
+- Git metadata in a standalone checkout or an allowed linked worktree is compared with the declared revision without running Git. If the metadata cannot be verified, the revision is recorded as unverified (`head_matches: false`). `head_matches: true` only
   means that `.git/HEAD` names the declared commit; it does not prove the working tree is clean or matches that commit.
   Symlinks and special files (FIFO, socket) in a source or input tree are refused. The whole tree, including `.git` and file modes, is hashed.
 - Missing image, runtime, changed source/inputs, non-zero exits, missing `result.json` and failed checks are
@@ -116,11 +204,17 @@ the run from an independent source** (hand calculation, published table, other i
 
 Project ids come from file or directory names; a name with letters outside a-z gets a short hash suffix. Names that differ only in case or punctuation (`My App`, `my-app`) share an id: re-importing one under the other is refused unless you pass an explicit project or research id.
 
-Project decisions in the report: `NOT_APPLICABLE`, `ANALYSIS_ONLY`, `EXPERIMENT_NOT_RUN`, `EXPERIMENT_BLOCKED`,
-`EXPERIMENT_FAILED`, `REPRODUCED_BENEFIT_UNPROVEN`, `BENEFIT_PENDING_REVIEW`, `BENEFIT_DEMONSTRATED`,
+Project decisions in the report: `APPLICABILITY_PENDING_REVIEW`, `ANALYSIS_REVIEW_REQUIRED`,
+`NOT_APPLICABLE`, `ANALYSIS_ONLY`, `EXPERIMENT_NOT_RUN`, `EXPERIMENT_BLOCKED`,
+`EXPERIMENT_FAILED`, `EXPERIMENT_INCOMPLETE`, `NEEDS_PROJECT_EVIDENCE`,
+`REPRODUCED_BENEFIT_UNPROVEN`, `BENEFIT_PENDING_REVIEW`, `BENEFIT_CRITERIA_MET`, `BENEFIT_DEMONSTRATED`,
 `MIXED_EVIDENCE` (some experiments passed, others did not), `STALE`, `STALE_EVIDENCE`. Verdicts are re-derived from the
-stored plan and result objects on every report. The per-arm exit code, error, timeout flag and result hash are sealed in a content-addressed object when the run is saved and read back from it (a run row without it never passes), so editing the row cannot turn a failure into a pass; an actor who can rewrite both the row and the objects can still change a verdict. The latest run
-of each experiment counts; earlier runs are listed by count and kept in the export.
+stored plan and result objects on every report. Per-arm exit codes, errors, timeouts and result hashes
+come from a sealed content-addressed record. The report evaluates all stored attempts in insertion
+order. A later pass retains earlier failures in the project verdict, and changes to a displayed
+timestamp cannot change the attempt order. Someone with write access to the workspace database and
+object store can still change the evidence. A declared revision without Git metadata and an image
+that cannot be checked are flagged in the report.
 A passing run proves the stated numbers on the stated inputs, not production benefit: real target data,
 a declared baseline and quality/cost criteria are required for that.
 
@@ -193,7 +287,9 @@ This mode does not confirm that the system is fit to execute arbitrary untrusted
   separately.
 - An analysis citation may include a non-empty `claim` describing the specific statement it supports.
   Reports expose `citation_warnings` when a lexical check finds a possible negation, condition or
-  unit mismatch. These signals are advisory and independent review is still required for a benefit claim.
+  unit mismatch. Reports flag missing claim links and nearby qualifiers as well. These signals are advisory.
+  The success of the programs, the relevance of the measured proxy and the applicability of the claim
+  remain separate questions for review.
 - An environment HTTP proxy is ignored for the model endpoint, so the API key goes directly to the configured base URL.
 - `export` writes a portable projection of the report, the plan and every run of each experiment
   (hashes, checks, expected/actual values, image ID and timings) and a manifest with hashes of the
@@ -202,6 +298,23 @@ This mode does not confirm that the system is fit to execute arbitrary untrusted
   verifies the exported files. The archive omits log text and downloaded code. Known experiment
   paths, selected host path patterns and known experiment directory names are redacted in supported
   fields. Review arbitrary text, arguments, metadata and optional memory before sharing.
+
+### Current and historical evidence
+
+Current project decisions use attempts registered against the current analysis. Older
+registrations remain visible as history. A changed container image marks each affected
+attempt stale. Detailed and portable run records retain the original `score_status` and show
+the current evidence status in `status`. Interrupted attempts remain in the history. Attempts are recorded before preflight. A new run,
+export, or decision recording reconciles a leftover `RUNNING` attempt in the same job
+under the workspace writer lock. Read-only views also report an orphaned attempt as
+interrupted when the writer lock is idle. Later successful retries preserve the interruption
+and keep mixed evidence visible.
+If a benefit test passes against a proposed rejection, the project reports
+`APPLICABILITY_CONFLICT` and calls for a revised assessment. Runs from older versions
+that lack a seal bound to the specific attempt remain inspectable. Register and run a
+new experiment for a current verdict. A legacy review without an evidence hash remains
+in the audit record. Submit a passing review with the current packet hash to finalize
+a verdict.
 
 ### Measuring workflow throughput
 
@@ -214,3 +327,14 @@ as separate outcomes. The existing writer lock serializes runs sharing one works
 workloads share one workspace or use separately isolated workspaces. Counterbalance route order with
 different operators or matched unseen candidates where possible to reduce carryover from prior study
 review. Treat a small pilot as an exploratory estimate.
+
+Project review tokens bind the job, both research and project snapshots, the declared
+author and current experiment evidence. Reviews made with the earlier token format remain
+in history and need a new review packet to approve the current decision. The adapter's
+`handoff_status` describes qualification and the combined size of original sources.
+The product also validates imported text documents during handoff.
+
+The launcher retains the workspace lock while the Podman client is active. If the
+runner dies, the launcher stops the client and removes its named container before
+releasing the lock. Recovery then records the interrupted attempt. This behavior
+requires the launcher process itself and the host kernel to remain operational.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paper2project"
-version = "1.0.1"
+version = "1.0.2"
 description = "Evidence-backed research applicability experiments for project memories, over CLI and MCP"
 readme = "docs/product/README.md"
 license-files = ["LICENSE", "NOTICE.md", "licenses/Paper2Agent-MIT.txt"]

@@ -103,15 +103,21 @@ def parse_json(text):
 def analyze(app, job_id, endpoint, query="", max_chars=60000, attempts=3):
     """Submit the model's grounded analysis; validation errors are fed back, never bypassed."""
     context = app.context(job_id, query, max_chars)
+    if context["truncated"]:
+        raise ValueError(f"Standalone analysis would omit {context['omitted_chunks']} source chunks. "
+                         "Read the complete evidence through MCP document_read or prepare and submit a reviewed analysis.")
+    source = context["research_source"]
     messages = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": json.dumps({"projects": [p["id"] for p in context["job"]["projects"]],
+                                                         "source_coverage": source["coverage"],
+                                                         "source_limitations": source["limitations"],
                                                          "documents": context["documents"], "chunks": context["chunks"],
                                                          "omitted_chunks": context["omitted_chunks"]}, ensure_ascii=False)}]
     error = None
     for _ in range(attempts):
         reply = endpoint.complete(messages)
         try:
-            return app.submit_analysis(job_id, parse_json(reply))
+            return app.submit_analysis(job_id, parse_json(reply), author=f"model:{endpoint.host}/{endpoint.model}")
         except ValueError as exc:
             error = exc
             messages += [{"role": "assistant", "content": reply},

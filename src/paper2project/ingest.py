@@ -3,15 +3,17 @@ from __future__ import annotations
 
 from html.parser import HTMLParser
 import http.client
+import hashlib
 import io
 from pathlib import Path
 import ipaddress
+import json
 import socket
 import time
 import urllib.parse
 import urllib.request
 
-from .store import identifier, now, regular_file, slug
+from .store import digest, identifier, now, regular_file, slug
 
 MAX_FILE = 32 * 1024 * 1024
 MAX_MEMORY = 16 * 1024 * 1024
@@ -50,11 +52,11 @@ def _files(root):
     return sorted(found)
 
 
-def documents(store, root, *, prefix, max_bytes=MAX_MEMORY):
+def document_payloads(root, max_bytes):
     paths = _files(root)
     if not paths or len(paths) > MAX_DOCUMENTS:
         raise ValueError("Input needs 1..200 text documents")
-    total, docs = 0, []
+    total = 0
     for path in paths:
         with regular_file(path) as stream:
             payload = stream.read(max_bytes - total + 1)
@@ -65,9 +67,28 @@ def documents(store, root, *, prefix, max_bytes=MAX_MEMORY):
         if "\0" in text:
             raise ValueError("Binary document is not supported")
         name = path.name if root.is_file() else path.relative_to(root).as_posix()
-        docs.append({"id":prefix + ":" + name, "path":name, "sha256":store.put(payload),
-                     "text":store.put(text.encode()), "lines":len(text.splitlines()), "kind":"text"})
-    return docs
+        yield name, payload, text
+
+
+def documents(store, root, *, prefix, max_bytes=MAX_MEMORY):
+    return [{"id": prefix + ":" + name, "path": name, "sha256": store.put(payload),
+             "text": store.put(text.encode()), "lines": len(text.splitlines()), "kind": "text"}
+            for name, payload, text in document_payloads(root, max_bytes)]
+
+
+def validate_handoff_size(sources):
+    if sum(plain_path(path).stat().st_size for path in sources) > MAX_FILE:
+        raise ValueError("Qualified source bundle exceeds 32 MiB")
+
+
+def validate_handoff_inputs(package, sources, inventory):
+    validate_handoff_size(sources)
+    package_root = plain_path(package)
+    validate_package_inventory(package_root, inventory)
+    if "references/paper.md" not in inventory:
+        raise ValueError("Qualified package needs references/paper.md for research citations")
+    for _ in document_payloads(package_root, MAX_FILE):
+        pass
 
 
 def import_projects(store, source, layout="auto", name=None, project_id=None):
@@ -94,10 +115,12 @@ def import_projects(store, source, layout="auto", name=None, project_id=None):
         seen.add(pid)
         docs = documents(store,path,prefix="project:"+pid)
         snap = {"kind":"project", "id":pid,"name":title,"documents":docs}
-        revision = store.put_json(snap)
         old = next((p for p in store.list("project") if p["id"] == pid),None)
         if old and not project_id and old["name"] != title:
             raise ValueError(f"Project id {pid!r} already belongs to {old['name']!r}; names that differ only in case or punctuation collide, pass an explicit project id")
+        if old and (assets := store.json(old["snapshot"]).get("assets")):
+            snap["assets"] = assets
+        revision = store.put_json(snap)
         prepared.append({"id":pid,"name":title,"snapshot":revision,"updated_at":now(),
                          "revision":(old["revision"] + (old["snapshot"] != revision)) if old else 1,
                          "documents":len(docs)})
@@ -109,7 +132,9 @@ def import_projects(store, source, layout="auto", name=None, project_id=None):
 def check_address(address,hostname):
     """Refuse non-public destinations; applied to every address actually used for a connection."""
     ip = ipaddress.ip_address(address.split("%")[0])
-    fake_ip = ip in ipaddress.ip_network("198.18.0.0/15") and hostname in {"arxiv.org", "www.nature.com", "idp.nature.com", "static-content.springer-cdn.com", "raw.githubusercontent.com", "github.com"}
+    fake_ip = ip in ipaddress.ip_network("198.18.0.0/15") and hostname in {
+        "arxiv.org", "www.nature.com", "idp.nature.com", "static-content.springer-cdn.com",
+        "raw.githubusercontent.com", "github.com"}
     embedded = None
     if ip.version == 6:
         embedded = ip.ipv4_mapped or (ipaddress.IPv4Address(ip.packed[-4:]) if any(
@@ -175,12 +200,14 @@ def read_http_limited(response, max_bytes, deadline):
         if len(content) > max_bytes:
             raise ValueError("Research download exceeds32MiB")
 
+
 class TextHTML(HTMLParser):
     def __init__(self):
         super().__init__(); self.skip=0; self.parts=[]
     def handle_starttag(self,tag,attrs):
         if tag in {"script","style"}: self.skip+=1
-        if tag in {"p","div","br","h1","h2","h3","h4","h5","h6","li","tr","td","th","pre","blockquote","section"}: self.parts.append("\n")
+        if tag in {"p","div","br","h1","h2","h3","h4","h5","h6","li",
+                   "tr","td","th","pre","blockquote","section"}: self.parts.append("\n")
     def handle_endtag(self,tag):
         if tag in {"script","style"}: self.skip=max(0,self.skip-1)
     def handle_data(self,data):
@@ -243,6 +270,139 @@ def import_research(store,source,title=None,research_id=None,origin=None):
     if len(text.encode())>MAX_FILE or "\0" in text: raise ValueError("Invalid or oversized research text")
     doc={"id":"research:"+rid+":"+filename,"path":filename,"sha256":original,"text":store.put(text.encode()),"lines":len(text.splitlines()),"kind":"research"}
     return _research_record(store,rid,title or filename,[doc],origin or (location if location.startswith("https://") else "local-file"),{"coverage":coverage,"limitations":limits},bool(research_id))
+
+
+
+def validate_package_inventory(package_root, inventory):
+    present = set()
+    for count, path in enumerate(package_root.rglob("*"), 1):
+        if count > MAX_DISCOVERY:
+            raise ValueError("Qualified package exceeds inventory limit")
+        if path.is_symlink():
+            raise ValueError("Qualified package contains a symlink")
+        if path.is_file():
+            present.add(path.relative_to(package_root).as_posix())
+        elif not path.is_dir():
+            raise ValueError("Qualified package contains a special file")
+    if present != set(inventory):
+        raise ValueError("Qualified package inventory does not match its files")
+    for name, expected in inventory.items():
+        if not isinstance(name, str):
+            raise ValueError("Qualified package contains an unsafe path")
+        relative = Path(name)
+        if (relative.is_absolute() or not relative.parts
+                or any(part in {"", ".", ".."} for part in relative.parts)):
+            raise ValueError("Qualified package contains an unsafe path")
+        hasher = hashlib.sha256()
+        with regular_file(package_root / relative) as stream:
+            for block in iter(lambda: stream.read(1 << 20), b""):
+                hasher.update(block)
+        if hasher.hexdigest() != expected:
+            raise ValueError("Qualified package file changed after verification: " + name)
+
+def import_reviewed_package(store, package, research_id, title, origin, qualification, inventory, sources):
+    """Accept artifacts from the local Paper2Agent verifier, checking their pinned bytes."""
+    try:
+        captured, records = qualification["captured"], qualification["records"]
+        report = json.loads(captured["verification.json"])
+        review = json.loads(captured["independent-review.json"])
+        manifest = json.loads(captured["source-manifest"])
+        build = json.loads(captured["build.json"])
+        fingerprint = digest(json.dumps(records, sort_keys=True).encode())
+        valid = (
+            all(digest(captured[name]) == records[name] for name in ("verification.json", "source-manifest", "build.json"))
+            and review["decision"] == "PASS" and isinstance(review["reviewer"], str) and review["reviewer"].strip()
+            and qualification["fingerprint"] == review["fingerprint"] == fingerprint
+            and report["status"] == qualification["verification_status"]
+            and report["status"] in {"reviewed", "reviewed_with_limitations"}
+            and report["mechanical_ok"] is True and report["all_sources_agent_reviewed"] is True
+            and manifest["full_text_status"] == "COMPLETE"
+            and build["files"] == inventory
+            and [(role, key) for _, role, key in sources] == [(e["role"], e["sha256"]) for e in manifest["sources"]]
+            and sum(role == "main" for _, role, _ in sources) == 1
+            and all(role in {"main", "supplement"} for _, role, _ in sources)
+            and isinstance(qualification["limitations"], list)
+            and all(isinstance(limit, str) for limit in qualification["limitations"])
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
+        valid = False
+    if not valid:
+        raise ValueError("Invalid qualified Paper2Agent receipt or source inventory")
+    limitations = report.get("limitations") or (["Paper2Agent review recorded limitations; consult the source review."]
+                                                 if report["status"] == "reviewed_with_limitations" else [])
+    if limitations != qualification["limitations"]:
+        raise ValueError("Qualified Paper2Agent limitations disagree with the verification record")
+    primary = next(e for e in manifest["sources"] if e["role"] == "main")
+    origin = primary.get("resolved_url") or primary.get("url") or origin or "local-reviewed-package"
+    rid = identifier(research_id)
+    package_root = plain_path(package)
+    validate_handoff_inputs(package_root, [path for path, _, _ in sources], inventory)
+    docs = documents(store, package_root, prefix="research:" + rid, max_bytes=MAX_FILE)
+    for doc in docs:
+        doc["evidence_role"] = ("source_reference" if doc["path"] in
+                                {"references/paper.md", "references/supplement.md", "references/index.md"}
+                                else "package_scaffolding")
+    expected_docs = {name: key for name, key in inventory.items()
+                     if not any(part.startswith(".") for part in Path(name).parts)
+                     and Path(name).suffix.lower() in {".md", ".markdown", ".txt"}}
+    if expected_docs != {doc["path"]: doc["sha256"] for doc in docs}:
+        raise ValueError("Paper2Agent package text changed after qualification")
+    validate_handoff_size(path for path, _, _ in sources)
+    raw_sources = []
+    total = 0
+    for path, role, expected in sources:
+        source = plain_path(path)
+        with regular_file(source) as stream:
+            payload = stream.read(MAX_FILE - total + 1)
+        total += len(payload)
+        if total > MAX_FILE:
+            raise ValueError("Qualified source bundle exceeds 32 MiB")
+        actual = store.put(payload)
+        if actual != expected:
+            raise ValueError("Paper2Agent source changed after qualification")
+        raw_sources.append({"role": role, "sha256": actual})
+    metadata = {"coverage": "PAPER2AGENT_REVIEW_RECORDED", "limitations": qualification["limitations"],
+                "qualification": {"fingerprint": qualification["fingerprint"],
+                                  "verification_status": qualification["verification_status"],
+                                  "review_digest": store.put(captured["independent-review.json"]),
+                                  "manifest_digest": store.put(captured["source-manifest"]),
+                                  "source_artifacts": raw_sources}}
+    return _research_record(store, rid, title, docs, origin, metadata, explicit=True)
+
+
+def research_metadata(store, research):
+    snapshot = store.json(research["snapshot"])
+    origin = snapshot.get("origin")
+    if isinstance(origin, str):
+        try:
+            parsed = urllib.parse.urlsplit(origin)
+        except ValueError:
+            parsed = urllib.parse.urlsplit("")
+        if parsed.scheme in {"http", "https"} and parsed.hostname and not (parsed.username or parsed.password):
+            origin = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+        elif origin not in {"local-file", "local-reviewed-package"}:
+            origin = "local-file"
+    coverage = snapshot.get("coverage", "UNATTESTED")
+    qualification = snapshot.get("qualification")
+    limits = snapshot.get("limitations", [])
+    if coverage == "PAPER2AGENT_REVIEW_RECORDED" and not all(
+            (qualification or {}).get(field) for field in ("review_digest", "manifest_digest")):
+        coverage = "PAPER2AGENT_LEGACY_REVIEW_UNVERIFIED"
+        limits = [*limits, "This handoff predates verified receipt binding; import it again to establish current coverage."]
+    evidence = None
+    if qualification:
+        objects = [(source["role"], source["sha256"]) for source in qualification.get("source_artifacts", [])]
+        objects.extend((role, qualification.get(field)) for role, field in
+                       (("review", "review_digest"), ("manifest", "manifest_digest")))
+        unavailable = []
+        for role, key in objects:
+            try:
+                store.blob(key)
+            except (ValueError, OSError):
+                unavailable.append({"role": role, "sha256": key})
+        evidence = {"status": "UNAVAILABLE" if unavailable else "AVAILABLE", "unavailable": unavailable}
+    return {**research, "origin": origin, "coverage": coverage,
+            "limitations": limits, "qualification": qualification, "evidence": evidence}
 
 
 def _research_record(store,rid,title,docs,origin,metadata,explicit=False):

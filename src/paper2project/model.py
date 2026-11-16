@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -54,8 +55,24 @@ class Endpoint:
                            "response_format": {"type": "json_object"}}).encode()
         request = urllib.request.Request(self.url, body, headers, method="POST")
         try:
+            deadline = time.monotonic() + self.timeout
             with urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect).open(request, timeout=self.timeout) as response:
-                raw = response.read(MAX_RESPONSE + 1)
+                content = bytearray()
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Model response exceeded total time limit")
+                    sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+                    if sock is not None:
+                        sock.settimeout(min(self.timeout, remaining))
+                    block = (response.read1 if hasattr(response, "read1") else response.read)(
+                        min(65536, MAX_RESPONSE + 1 - len(content)))
+                    if not block:
+                        break
+                    content.extend(block)
+                    if len(content) > MAX_RESPONSE:
+                        raise ValueError("Model response exceeds 4 MiB")
+                raw = bytes(content)
         except urllib.error.HTTPError as exc:
             raise ValueError(f"Model endpoint returned HTTP {exc.code}") from exc
         except (urllib.error.URLError, OSError) as exc:

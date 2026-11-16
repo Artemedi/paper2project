@@ -19,7 +19,7 @@ import stat
 import subprocess
 import time
 
-from .store import digest, dumps, loads, now, unique
+from .store import digest, dumps, loads, now, regular_file, unique
 
 LIMITS = {"timeout": 120, "memory_mb": 1024, "cpus": 2, "pids": 128}
 MAX_RESULT = 1024 * 1024
@@ -66,13 +66,23 @@ def image_id(image):
 
 def file_digest(path, limit=None):
     """Streaming SHA-256; refuses files above limit before reading them."""
-    if limit is not None and path.stat().st_size > limit:
-        raise ValueError(f"File larger than {limit} bytes: {path.name}")
-    hasher = hashlib.sha256()
-    with path.open("rb") as stream:
+    path = Path(path)
+    hasher, size = hashlib.sha256(), 0
+    with regular_file(path) as stream:
         for block in iter(lambda: stream.read(1 << 20), b""):
+            size += len(block)
+            if limit is not None and size > limit:
+                raise ValueError(f"File larger than {limit} bytes: {path.name}")
             hasher.update(block)
     return hasher.hexdigest()
+
+def bounded_tree(root):
+    paths = []
+    for path in root.rglob("*"):
+        if len(paths) >= MAX_TREE_FILES or len(path.relative_to(root).parts) > 32:
+            raise ValueError("Experiment tree exceeds file or depth limits")
+        paths.append(path)
+    return sorted(paths)
 
 
 def tree_hash(path):
@@ -81,7 +91,7 @@ def tree_hash(path):
     if root.is_symlink() or not root.is_dir():
         raise ValueError("Experiment tree must be a real directory: " + str(path))
     entries, total = [], 0
-    for item in sorted(root.rglob("*")):
+    for item in bounded_tree(root):
         relative = item.relative_to(root).as_posix()
         if item.is_symlink():
             raise ValueError("Symlink in experiment tree: " + relative)
@@ -110,7 +120,7 @@ def copy_tree(source, destination, expected):
     directories = []
     copied = 0
     try:
-        for item in sorted(source.rglob("*")):
+        for item in bounded_tree(source):
             relative = item.relative_to(source)
             target = destination / relative
             mode = item.lstat().st_mode
@@ -118,10 +128,7 @@ def copy_tree(source, destination, expected):
                 target.mkdir(mode=0o700)
                 directories.append((target, mode & 0o7777))
             elif stat.S_ISREG(mode):
-                fd = os.open(item, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # never block on a swapped-in FIFO
-                with os.fdopen(fd, "rb") as read, open(target, "xb") as write:
-                    if not stat.S_ISREG(os.fstat(read.fileno()).st_mode):
-                        raise ValueError("Experiment tree entry is not a regular file: " + relative.as_posix())
+                with regular_file(item) as read, open(target, "xb") as write:
                     for block in iter(lambda: read.read(1 << 20), b""):
                         copied += len(block)
                         if copied > MAX_TREE_BYTES:  # a file that keeps growing cannot fill the workspace
@@ -260,7 +267,8 @@ def paired_guard(guard, base, candidate):
             return {**result, "ratio": ratio, "passed": ratio >= guard["min_ratio"]}
         if unit == "relative_fraction" and base == 0:
             if guard.get("zero_baseline_policy") == "require_non_worse":
-                return {**result, "reason": "ZERO_BASE_NON_WORSE", "passed": delta >= 0}
+                return {**result, "reason": "ZERO_BASE_NON_WORSE",
+                        "passed": delta >= 0 and guard.get("min_gain", 0) == 0}
             return {**result, "reason": "ZERO_BASELINE_FOR_RELATIVE_METRIC"}
         change = delta if unit == "absolute" else delta / abs(base)
     except OverflowError:
@@ -283,10 +291,10 @@ def validate_plan(plan, project_ids):
         raise ValueError("image must be a local container image reference")
     source = plan.get("source")
     if not isinstance(source, dict) or not isinstance(source.get("path"), str) \
-            or not re.fullmatch(r"[0-9a-f]{40}", str(source.get("revision", ""))) \
+            or not source["path"].strip() or not re.fullmatch(r"[0-9a-f]{40}", str(source.get("revision", ""))) \
             or not isinstance(source.get("license"), str) or not source["license"].strip():
         raise ValueError("source needs path, 40-hex revision and license")
-    if plan.get("input") is not None and (not isinstance(plan["input"], dict) or not isinstance(plan["input"].get("path"), str)):
+    if plan.get("input") is not None and (not isinstance(plan["input"], dict) or not isinstance(plan["input"].get("path"), str) or not plan["input"]["path"].strip()):
         raise ValueError("input must be {path}")
     if not isinstance(plan.get("arms"), dict):
         raise ValueError("arms must be {baseline, candidate}")
@@ -402,8 +410,10 @@ def evaluate(app, run):
     arms = run.get("arms") or {}
     if not arms:
         return {**run, "status": "BLOCKED" if run.get("status") == "BLOCKED" else "FAIL"}
-    if not run.get("sealed"):  # facts that decide the verdict must come from a hashed object, not from an editable row
-        return {**run, "status": "FAIL", "reproduced": False, "benefit": None, "reason": "run has no sealed arm facts"}
+    if not run.get("sealed"):  # unsealed interrupted arms are informative, never PASS
+        state = run.get("status")
+        return {**run, "status": state if state in {"RUNNING", "INTERRUPTED"} else "FAIL",
+                "reproduced": False, "benefit": None, "reason": run.get("reason") or "run has no sealed arm facts"}
     facts = app.store.json(run["sealed"])  # rehashed on read
     if set(facts) != set(arms):
         return {**run, "status": "FAIL", "reproduced": False, "benefit": None, "reason": "sealed arm facts disagree with the run row"}
@@ -447,31 +457,61 @@ def read_log(path):
 
 
 def collect(record, out, stdout, stderr):
-    """Hash and parse everything the container wrote; the container is hostile, so failures become records."""
+    """Hash and parse container output without following symlinks or special files."""
     record["stdout"], record["stderr"] = read_log(stdout), read_log(stderr)
     record["stdout_sha256"], record["stderr_sha256"] = file_digest(stdout), file_digest(stderr)
     files, entries = {}, 0
-    for item in out.rglob("*"):
-        entries += 1
-        relative = item.relative_to(out).as_posix()
-        if entries > MAX_OUTPUT_ENTRIES:
-            record["error"] = "Output has more than 1000 entries"
-            break
-        if item.is_symlink():
-            record["error"] = "Output contains a symlink: " + relative
-        elif item.is_file():
-            try:
-                files[relative] = file_digest(item, MAX_OUTPUT_FILE)
-            except ValueError:
-                files[relative] = None
-                record["error"] = f"Output file {relative} exceeds {MAX_OUTPUT_FILE} bytes"
-    record["output_files"] = files
-    result_path = out / "result.json"
-    if record["exit_code"] == 0 and not record["error"]:
-        if result_path.is_symlink() or not result_path.is_file() or result_path.stat().st_size > MAX_RESULT:
-            raise ValueError("result.json missing, unsafe or larger than 1 MiB")
-        raw = result_path.read_bytes()
-        record["result"], record["result_sha256"] = loads(raw), digest(raw)
+    root_fd = os.open(out, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        pinned = os.fstat(root_fd)
+        for directory, folders, names, descriptor in os.fwalk(".", dir_fd=root_fd, follow_symlinks=False):
+            for name in folders + names:
+                entries += 1
+                if entries > MAX_OUTPUT_ENTRIES:
+                    record["error"] = "Output has more than 1000 entries"
+                    break
+                relative = (Path(directory) / name).as_posix()
+                info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    record["error"] = "Output contains a symlink or special file: " + relative
+                    continue
+                hasher, size = hashlib.sha256(), 0
+                with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                      dir_fd=descriptor), "rb") as stream:
+                    if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                        raise ValueError("Output entry changed to a special file: " + relative)
+                    for block in iter(lambda: stream.read(1 << 20), b""):
+                        size += len(block)
+                        if size > MAX_OUTPUT_FILE:
+                            break
+                        hasher.update(block)
+                if size > MAX_OUTPUT_FILE:
+                    files[relative] = None
+                    record["error"] = f"Output file {relative} exceeds {MAX_OUTPUT_FILE} bytes"
+                else:
+                    files[relative] = hasher.hexdigest()
+            if entries > MAX_OUTPUT_ENTRIES:
+                break
+        record["output_files"] = files
+        try:
+            current = os.stat(out, follow_symlinks=False)
+        except OSError:
+            raise ValueError("Output root changed during collection")
+        if (current.st_dev, current.st_ino) != (pinned.st_dev, pinned.st_ino):
+            raise ValueError("Output root changed during collection")
+        if record["exit_code"] == 0 and not record["error"]:
+            with os.fdopen(os.open("result.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                  dir_fd=root_fd), "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise ValueError("result.json must be a regular file")
+                raw = stream.read(MAX_RESULT + 1)
+            if len(raw) > MAX_RESULT:
+                raise ValueError("result.json missing, unsafe or larger than 1 MiB")
+            record["result"], record["result_sha256"] = loads(raw), digest(raw)
+    finally:
+        os.close(root_fd)
 
 
 def container_root_pid(name):
@@ -552,17 +592,21 @@ def deleted_open_bytes(pids, device):
     return total
 
 
-def deleted_mapping(pids, device):
+def deleted_mapping(pids, device, roots=()):
     """True if a container process maps a file that was unlinked on the output filesystem. Its size cannot be read from the host
     (map_files is not accessible), so the mapping is treated as a breach rather than counted."""
     want = f"{os.major(device):02x}:{os.minor(device):02x}"
+    # Btrfs can expose different device numbers in stat and procfs.
+    prefixes = tuple(str(root).rstrip("/") + "/" for root in roots)
     for pid in pids:
         try:
             with open(f"/proc/{pid}/maps") as handle:
                 for line in handle:
                     fields = line.split(None, 5)
-                    if len(fields) == 6 and fields[3] == want and fields[5].rstrip().endswith("(deleted)"):
-                        return True
+                    if len(fields) == 6:
+                        path = fields[5].removesuffix("\n")
+                        if path.endswith(" (deleted)") and (fields[3] == want or path.startswith(prefixes)):
+                            return True
         except (FileNotFoundError, ProcessLookupError):
             continue
         except PermissionError:
@@ -579,36 +623,52 @@ def output_breach(stdout, stderr, out, pids=()):
             return f"{path.name} larger than {MAX_STREAM} bytes"
     total = entries = 0
     seen = set()
-    stack = [str(out)]
-    while stack:
+    def fail_walk(error):
+        raise error
+
+    # Pin the output root itself: fwalk(path) silently skips a symlink at its root.
+    try:
+        root_fd = os.open(out, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return "output directory is missing or unsafe"
+    try:
+        root_info = os.fstat(root_fd)
+        for _, directories, files, directory in os.fwalk(".", dir_fd=root_fd, follow_symlinks=False, onerror=fail_walk):
+            for name in directories + files:
+                entries += 1
+                if entries > MAX_OUTPUT_ENTRIES:
+                    return f"more than {MAX_OUTPUT_ENTRIES} output entries"
+                try:
+                    info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(info.st_mode):
+                    return "output contains a symlink"
+                if not stat.S_ISDIR(info.st_mode) and (info.st_dev, info.st_ino) not in seen:
+                    seen.add((info.st_dev, info.st_ino))
+                    total += max(info.st_size, info.st_blocks * 512)  # logical or allocated, whichever is larger (sparse files)
+            if total > MAX_OUTPUT_TOTAL:
+                return f"output directory larger than {MAX_OUTPUT_TOTAL} bytes"
         try:
-            with os.scandir(stack.pop()) as it:
-                for item in it:
-                    entries += 1
-                    if entries > MAX_OUTPUT_ENTRIES:
-                        return f"more than {MAX_OUTPUT_ENTRIES} output entries"
-                    info = item.stat(follow_symlinks=False)
-                    if item.is_dir(follow_symlinks=False):
-                        stack.append(item.path)
-                    elif (info.st_dev, info.st_ino) not in seen:
-                        seen.add((info.st_dev, info.st_ino))
-                        total += max(info.st_size, info.st_blocks * 512)  # logical or allocated, whichever is larger (sparse files)
-        except FileNotFoundError:
-            continue
-        if total > MAX_OUTPUT_TOTAL:
-            return f"output directory larger than {MAX_OUTPUT_TOTAL} bytes"
-    if pids:
-        device = os.stat(out).st_dev
-        if deleted_mapping(pids, device):
-            return "an unlinked file is kept alive by a memory mapping"
-        if total + deleted_open_bytes(pids, device) > MAX_OUTPUT_TOTAL:
-            return f"output (including unlinked open files) larger than {MAX_OUTPUT_TOTAL} bytes"
+            current = os.stat(out, follow_symlinks=False)
+        except OSError:
+            return "output directory changed during scan"
+        if (current.st_dev, current.st_ino) != (root_info.st_dev, root_info.st_ino):
+            return "output directory changed during scan"
+        if pids:
+            device = root_info.st_dev
+            if deleted_mapping(pids, device, (str(Path(out).absolute()), "/output")):
+                return "an unlinked file is kept alive by a memory mapping"
+            if total + deleted_open_bytes(pids, device) > MAX_OUTPUT_TOTAL:
+                return f"output (including unlinked open files) larger than {MAX_OUTPUT_TOTAL} bytes"
+    finally:
+        os.close(root_fd)
     return None
 
 
 def stop_container(proc, name):
     """Kill by name first (killing the podman client does not stop the container), remove it, then end the client."""
-    for verb in (["kill", name], ["rm", "-f", name]):
+    for verb in (["kill", name], ["rm", "-f", "--time", "1", name]):
         try:
             subprocess.run([*podman_command(), *verb], capture_output=True, timeout=10)
         except (OSError, subprocess.SubprocessError, ValueError):
@@ -617,7 +677,10 @@ def stop_container(proc, name):
         os.killpg(proc.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
-    proc.wait()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Unable to reap terminated container launcher") from exc
 
 
 def run_arm(app, plan, image, experiment, run_dir, arm):
@@ -737,20 +800,31 @@ def run_experiment(app, job_id, experiment_id):
         run.update(status="BLOCKED", reason=str(exc), arms={}, checks=[], reproduced=False, benefit=None)
         return app.store.save("run", run["id"], run)
     try:
+        app.store.save("run", run["id"], {**run, "status": "RUNNING", "arms": {}, "checks": []})
         run_dir = app.store.root / "runs" / run["id"]
         run_dir.mkdir(mode=0o700)
         for arm in ARMS:  # separate fresh container per arm
             (run_dir / arm).mkdir(mode=0o700)
-        arms = {arm: run_arm(app, plan, run["image_id"], experiment, run_dir, arm) for arm in ARMS}
-        for record in arms.values():
+        arms = {}
+        for arm in ARMS:
+            record = run_arm(app, plan, run["image_id"], experiment, run_dir, arm)
             keep = record["result"]
             record["result"] = None if keep is None else app.store.put_json(keep)
+            arms[arm] = record
+            app.store.save("run", run["id"], {**run, "status": "RUNNING", "arms": dict(arms), "checks": []})
         sealed = app.store.put_json({arm: {k: rec[k] for k in SEALED} for arm, rec in arms.items()})
         saved = app.store.save("run", run["id"], {**run, "arms": arms, "sealed": sealed, "finished_at": now(), "status": "FAIL"})
         verdict = evaluate(app, saved)
         return app.store.save("run", run["id"], {**saved, **{k: verdict[k] for k in ("checks", "reproduced", "benefit", "status")}})
-    except Exception as exc:  # the attempt must stay on record even when bookkeeping fails
-        run.update(status="FAIL", reason=f"Run bookkeeping failed ({type(exc).__name__}): {exc}", arms={}, checks=[], reproduced=False, benefit=None)
+    except (KeyboardInterrupt, SystemExit):
+        completed = app.store.get("run", run["id"]).get("arms", {})
+        app.store.save("run", run["id"], {**run, "status": "INTERRUPTED", "reason": "Execution was interrupted",
+                                         "arms": completed, "checks": [], "reproduced": False, "benefit": None})
+        raise
+    except Exception as exc:  # preserve any arm already measured before a failure
+        completed = app.store.get("run", run["id"]).get("arms", {})
+        run.update(status="FAIL", reason=f"Run bookkeeping failed ({type(exc).__name__}): {exc}",
+                   arms=completed, checks=[], reproduced=False, benefit=None)
         return app.store.save("run", run["id"], run)
 
 

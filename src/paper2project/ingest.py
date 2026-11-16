@@ -7,14 +7,16 @@ import io
 from pathlib import Path
 import ipaddress
 import socket
+import time
 import urllib.parse
 import urllib.request
 
-from .store import identifier, now, slug
+from .store import identifier, now, regular_file, slug
 
 MAX_FILE = 32 * 1024 * 1024
 MAX_MEMORY = 16 * 1024 * 1024
 MAX_DOCUMENTS = 200
+MAX_DISCOVERY = 20000
 
 
 def plain_path(value):
@@ -31,15 +33,21 @@ def _files(root):
     if root.is_file():
         return [root]
     found = []
-    for path in sorted(root.rglob("*")):
+    for count, path in enumerate(root.rglob("*"), 1):
+        if count > MAX_DISCOVERY:
+            raise ValueError("Input tree exceeds discovery limit")
         relative = path.relative_to(root)
+        if len(relative.parts) > 32:
+            raise ValueError("Input tree exceeds depth limit")
         if any(part.startswith(".") for part in relative.parts):
             continue
         if path.is_symlink():
             raise ValueError("Symlink in input tree: " + str(relative))
         if path.is_file() and path.suffix.lower() in {".md", ".markdown", ".txt"}:
             found.append(path)
-    return found
+            if len(found) > MAX_DOCUMENTS:
+                raise ValueError("Input needs 1..200 text documents")
+    return sorted(found)
 
 
 def documents(store, root, *, prefix, max_bytes=MAX_MEMORY):
@@ -48,9 +56,8 @@ def documents(store, root, *, prefix, max_bytes=MAX_MEMORY):
         raise ValueError("Input needs 1..200 text documents")
     total, docs = 0, []
     for path in paths:
-        if path.stat().st_size > max_bytes:
-            raise ValueError("Input document exceeds byte limit")
-        payload = path.read_bytes()
+        with regular_file(path) as stream:
+            payload = stream.read(max_bytes - total + 1)
         total += len(payload)
         if total > max_bytes:
             raise ValueError("Input document set exceeds byte limit")
@@ -72,7 +79,7 @@ def import_projects(store, source, layout="auto", name=None, project_id=None):
     single = root.is_file() or layout == "single" or (layout == "auto" and name is not None)
     if project_id and not single:
         raise ValueError("project_id requires single-project import")
-    paths = [root] if single else sorted(p for p in root.iterdir() if not p.name.startswith(".") and (p.is_dir() or p.suffix.lower() in {".md", ".markdown"}))
+    paths = [root] if single else sorted(p for p in root.iterdir() if not p.name.startswith(".") and (p.is_dir() or p.suffix.lower() in {".md", ".markdown", ".txt"}))
     if not paths or len(paths) > 100:
         raise ValueError("Catalogue needs 1..100 project memories")
     prepared = []
@@ -102,7 +109,7 @@ def import_projects(store, source, layout="auto", name=None, project_id=None):
 def check_address(address,hostname):
     """Refuse non-public destinations; applied to every address actually used for a connection."""
     ip = ipaddress.ip_address(address.split("%")[0])
-    fake_ip = ip in ipaddress.ip_network("198.18.0.0/15") and hostname in {"arxiv.org", "www.nature.com", "raw.githubusercontent.com", "github.com"}
+    fake_ip = ip in ipaddress.ip_network("198.18.0.0/15") and hostname in {"arxiv.org", "www.nature.com", "idp.nature.com", "static-content.springer-cdn.com", "raw.githubusercontent.com", "github.com"}
     embedded = None
     if ip.version == 6:
         embedded = ip.ipv4_mapped or (ipaddress.IPv4Address(ip.packed[-4:]) if any(
@@ -151,12 +158,29 @@ class Redirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req,fp,code,msg,headers,newurl)
 
 
+def read_http_limited(response, max_bytes, deadline):
+    content = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Research download exceeded total time limit")
+        sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+        if sock is not None:
+            sock.settimeout(min(30, remaining))
+        block = (response.read1 if hasattr(response, "read1") else response.read)(
+            min(65536, max_bytes + 1 - len(content)))
+        if not block:
+            return bytes(content)
+        content.extend(block)
+        if len(content) > max_bytes:
+            raise ValueError("Research download exceeds32MiB")
+
 class TextHTML(HTMLParser):
     def __init__(self):
         super().__init__(); self.skip=0; self.parts=[]
     def handle_starttag(self,tag,attrs):
         if tag in {"script","style"}: self.skip+=1
-        if tag in {"p","div","br","h1","h2","h3","li"}: self.parts.append("\n")
+        if tag in {"p","div","br","h1","h2","h3","h4","h5","h6","li","tr","td","th","pre","blockquote","section"}: self.parts.append("\n")
     def handle_endtag(self,tag):
         if tag in {"script","style"}: self.skip=max(0,self.skip-1)
     def handle_data(self,data):
@@ -167,21 +191,31 @@ def import_research(store,source,title=None,research_id=None,origin=None):
     rid = identifier(research_id) if research_id else slug(title or Path(urllib.parse.urlsplit(str(source)).path).stem or "research")
     location = str(source)
     if location.startswith(("https://","http://")):
+        deadline = time.monotonic() + 90
         public_url(location)
         request=urllib.request.Request(location,headers={"User-Agent":"Paper2Project/0.1"})
         with urllib.request.build_opener(urllib.request.ProxyHandler({}),Redirect(),PinnedHTTPS()).open(request,timeout=30) as response:
             public_url(response.url)
-            raw=response.read(MAX_FILE+1)
+            raw=read_http_limited(response, MAX_FILE, deadline)
             content_type=response.headers.get_content_type()
+            charset=response.headers.get_content_charset() or "utf-8"
         if len(raw)>MAX_FILE: raise ValueError("Research download exceeds32MiB")
-        filename=Path(urllib.parse.urlsplit(location).path).name or "research"
+        url_parts=urllib.parse.urlsplit(location)
+        requested_pdf=(url_parts.path.lower().endswith(".pdf")
+                       or (url_parts.hostname=="arxiv.org" and url_parts.path.startswith("/pdf/"))
+                       or content_type=="application/pdf")
+        if requested_pdf and not raw.startswith(b"%PDF-"):
+            raise ValueError("PDF source returned non-PDF content; possible access or CAPTCHA page")
+        filename=Path(url_parts.path).name or "research"
     else:
         path=plain_path(location)
         if path.is_dir():
             docs=documents(store,path,prefix="research:"+rid,max_bytes=MAX_FILE)
             return _research_record(store,rid,title or path.name,docs,origin or "local-reviewed-package",{"coverage":"IMPORTED_PACKAGE_REVIEW_NOT_ATTESTED"},bool(research_id))
-        if not path.is_file() or path.stat().st_size>MAX_FILE: raise ValueError("Research file missing or exceeds32MiB")
-        raw=path.read_bytes();filename=path.name;content_type=""
+        with regular_file(path) as stream:
+            raw = stream.read(MAX_FILE + 1)
+        if len(raw) > MAX_FILE: raise ValueError("Research file missing or exceeds32MiB")
+        filename=path.name;content_type="";charset="utf-8"
     original=store.put(raw)
     limits=[]
     if raw.startswith(b"%PDF-"):
@@ -198,7 +232,11 @@ def import_research(store,source,title=None,research_id=None,origin=None):
         coverage="TEXT_EXTRACTED_NOT_VISUALLY_REVIEWED"
         limits=["Formatting, figures, equations, tables and separate supplements require source review."]
     elif "html" in content_type or raw.lstrip().lower().startswith((b"<!doctype html",b"<html")):
-        parser=TextHTML();parser.feed(raw.decode("utf-8"));text="".join(parser.parts)
+        try:
+            html=raw.decode(charset, errors="replace")
+        except LookupError:
+            html=raw.decode("utf-8", errors="replace")
+        parser=TextHTML();parser.feed(html);text="".join(parser.parts)
         coverage="HTML_TEXT_ONLY";limits=["HTML text extraction may omit figures, tables and supplementary material."]
     else:
         text=raw.decode("utf-8-sig");coverage="PROVIDED_TEXT_COMPLETENESS_UNATTESTED"

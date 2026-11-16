@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import sys
 import zipfile
 
@@ -26,9 +27,16 @@ EXCLUDE = {"__pycache__", ".pyc"}
 
 
 def collect():
+    tracked = subprocess.check_output(["git", "ls-files", "-z", "--", *FILES, *TREES], cwd=ROOT)
+    names = {p.decode("utf-8", "surrogateescape") for p in tracked.split(b"\0") if p}
+    if any(name not in names for name in FILES):
+        raise ValueError("Release manifest contains an untracked mandatory file")
     found = [ROOT / name for name in FILES]
-    for tree in TREES:
-        found += [p for p in sorted((ROOT / tree).rglob("*")) if p.is_file() and not (EXCLUDE & set(p.parts)) and p.suffix != ".pyc"]
+    for name in sorted(names - set(FILES)):
+        path = ROOT / name
+        if (path.suffix in {".py", ".md", ".json", ".jsonl"} and not any(
+                part.startswith(".") or part in EXCLUDE for part in Path(name).parts)):
+            found.append(path)
     return found
 
 
@@ -44,8 +52,9 @@ def main():
             relative = path.relative_to(ROOT).as_posix()
             info = zipfile.ZipInfo(prefix + relative, (2026, 1, 1, 0, 0, 0))
             info.external_attr = 0o644 << 16
-            archive.writestr(info, path.read_bytes())
-            inventory[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+            data = path.read_bytes()
+            archive.writestr(info, data)
+            inventory[relative] = hashlib.sha256(data).hexdigest()
         archive.writestr(zipfile.ZipInfo(prefix + "MANIFEST.json", (2026, 1, 1, 0, 0, 0)), json.dumps(inventory, indent=2, sort_keys=True))
     print(json.dumps({"path": str(destination), "files": len(inventory), "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
                       "bytes": destination.stat().st_size}, indent=2))

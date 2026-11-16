@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import tempfile
 import threading
 import uuid
@@ -63,6 +64,28 @@ def digest(value):
 def unique(prefix):
     return prefix + "-" + uuid.uuid4().hex[:16]
 
+
+@contextmanager
+def regular_file(path):
+    """Open one regular file through non-symlink directory descriptors."""
+    parts = Path(path).absolute().parts
+    directory = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY)
+    file_fd = None
+    try:
+        for part in parts[1:-1]:
+            next_dir = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = next_dir
+        file_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            raise ValueError("Input is not a regular file")
+        with os.fdopen(file_fd, "rb") as stream:
+            file_fd = None
+            yield stream
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(directory)
 
 class _WorkspaceLock:
     """One flock per canonical workspace and process; re-entrant for the owning thread only, fail-fast for everyone else."""
@@ -184,6 +207,11 @@ class Store:
                 os.fsync(stream.fileno())
             try:
                 os.link(temporary, path)
+                directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)  # make the object name durable before metadata can reference it
+                finally:
+                    os.close(directory)
             except FileExistsError:
                 if self.blob(key) != payload:
                     raise ValueError("Content-addressed object collision")

@@ -8,7 +8,7 @@ import re
 import zipfile
 
 from . import __version__, execution, ingest
-from .store import Store, digest, dumps as dumps_, now, unique
+from .store import Store, digest, dumps as dumps_, now, regular_file, unique
 
 
 HOST_PATH = re.compile(
@@ -41,6 +41,7 @@ def export_redactor(root, experiments, snapshots):
         for doc in snapshot["documents"]:
             aliases[doc["id"]] = "artifact:document:" + digest(doc["id"].encode())[:16]
             basenames.add(Path(doc["path"]).name)
+        basenames.update(snapshot.get("assets", {}))
     for experiment, plan, _ in experiments:
         for role in ("source", "input"):
             tree = experiment[f"{role}_tree"]
@@ -77,7 +78,7 @@ def export_redactor(root, experiments, snapshots):
         if isinstance(value, list):
             return [redact(item, field) for item in value]
         if isinstance(value, dict):
-            projected = {redact(key, field if field in ("expected", "actual", "output_files") else "field"):
+            projected = {redact(key, field if field in ("expected", "actual") else "field"):
                          redact(item, field if field in ("expected", "actual") else key)
                          for key, item in value.items()}
             if len(projected) != len(value):
@@ -132,14 +133,18 @@ class App:
     @writer
     def attach_asset(self,project_id,path,name=None):
         current=self.store.get("project",project_id)
+        if Path(path).is_symlink():
+            raise ValueError("Project asset must be a regular file <=8MiB")
         path=Path(self.local(path))
-        if path.is_symlink() or not path.is_file() or path.stat().st_size>8*1024*1024:
+        with regular_file(path) as stream:
+            payload=stream.read(8*1024*1024+1)
+        if len(payload)>8*1024*1024:
             raise ValueError("Project asset must be a regular file <=8MiB")
         asset_name=name or path.name
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}",asset_name): raise ValueError("Unsafe asset name")
         snap=self.store.json(current["snapshot"])
         assets=snap.setdefault("assets",{})
-        assets[asset_name]={"name":asset_name,"sha256":self.store.put(path.read_bytes()),"bytes":path.stat().st_size}
+        assets[asset_name]={"name":asset_name,"sha256":self.store.put(payload),"bytes":len(payload)}
         current.update(snapshot=self.store.put_json(snap),revision=current["revision"]+1,updated_at=now())
         self.store.save("project",project_id,current)
         return current
@@ -177,10 +182,11 @@ class App:
         for doc in docs.values():
             lines=self.store.blob(doc["text"]).decode().splitlines()
             for start in range(0,len(lines),70):
+                content="\n".join(lines[start:start+70])
                 text="\n".join(f"{i+1}: {line}" for i,line in enumerate(lines[start:start+70],start))
-                score=sum(word in text.casefold() for word in words)
+                score=sum(word in content.casefold() for word in words)
                 chunks.append({"document_id":doc["id"],"snapshot":doc["snapshot"],"owner":doc["owner"],"owner_kind":doc["owner_kind"],"start":start+1,"end":min(start+70,len(lines)),"text":text,"score":score})
-        chunks.sort(key=lambda c:(-c["score"],c["start"],c["document_id"]))
+        chunks.sort(key=lambda c:(-c["score"],c["document_id"],c["start"]))
         selected=[];size=0
         # Include at least one chunk per source owner before spending the rest.
         owners=list(dict.fromkeys((d["owner_kind"],d["owner"]) for d in docs.values()))

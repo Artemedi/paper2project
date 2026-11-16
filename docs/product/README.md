@@ -27,7 +27,7 @@ State lives in a workspace directory (`--workspace`, `$PAPER2PROJECT_WORKSPACE`,
 ## Workflow
 
 ```bash
-paper2project project import ./memories                    # directory: one project per subdirectory/.md file
+paper2project project import ./memories                    # directory: one project per subdirectory/.md/.txt file
 paper2project project import ./CLAUDE.md --name "My app"  # single Markdown file
 paper2project research import ./paper.pdf --title "Paper"  # .md/.txt/.pdf/https URL/reviewed package directory
 paper2project job create --research paper --project my-app --project other-app

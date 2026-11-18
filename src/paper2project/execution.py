@@ -1013,6 +1013,16 @@ def run_experiment(app, job_id, experiment_id):
             (run_dir / arm).mkdir(mode=0o700)
         arms = {}
         for arm in ARMS:
+            if arm == "candidate":
+                try:
+                    if tree_hash(experiment["source_path"]) != run["source_tree"]:
+                        raise ValueError("Source tree changed after baseline")
+                    if experiment["input_path"] and tree_hash(experiment["input_path"]) != run["input_tree"]:
+                        raise ValueError("Input tree changed after baseline")
+                except (ValueError, OSError) as exc:
+                    run.update(status="BLOCKED", reason=str(exc), arms=dict(arms), checks=[],
+                               reproduced=False, benefit=None, finished_at=now())
+                    return app.store.save("run", run["id"], run)
             record = run_arm(app, plan, run["image_id"], experiment, run_dir, arm)
             keep = record["result"]
             record["result"] = None if keep is None else app.store.put_json(keep)

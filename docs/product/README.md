@@ -245,7 +245,8 @@ This mode does not confirm that the system is fit to execute arbitrary untrusted
   github.com and raw.githubusercontent.com. Import research from sources you trust, or from local files.
 - At registration the source and input trees are copied into `<workspace>/snapshots/<experiment>/`, the copy is hashed and must
   equal the hash of the live directory (otherwise registration fails: the directory changed while being copied). Containers
-  mount only the copy, and its hash is checked again before every run, so later edits of the live directory neither change what
+  mount only the copy, and its hash is checked before baseline and again before candidate. If either source or input snapshot
+  changes between arms, candidate is blocked and the completed baseline evidence is retained. Later edits of the live directory neither change what
   runs nor invalidate the result: the result belongs to the snapshot hash, not to the current directory. Modes are copied
   exactly because they are part of the hash, so the copy is not made read-only on the host: a process of the same user with access
   to the (mode 0700) workspace could still change it between the pre-run check and the container start. Disk use is up to the
@@ -273,7 +274,16 @@ This mode does not confirm that the system is fit to execute arbitrary untrusted
   the process and file-descriptor limits; and many hidden files each up to 64 MiB can still be written between two polls, so a hard disk
   guarantee does not exist. The container runs as your uid (root if you run as root); the memory limit does not set `--memory-swap`, so swap may add to it: a fast writer can exceed a limit by write speed times poll and stop delay, and stopping can take up to
   about 20 s. For a hard guarantee put the workspace on a volume with a filesystem quota.
-- A PDF is parsed in the application process: its text is size-limited only after extraction, so a crafted compact PDF can use much memory or time while holding the workspace lock. Import PDFs from sources you trust. `report` reads state without the writer lock, so a concurrent writer can make one report slightly stale.
+- PDF text extraction runs in a fresh Linux interpreter with an empty environment and
+  closed unrelated file descriptors. Before importing `pypdf`, the worker limits its
+  address space to 512 MiB, CPU time to 15 s and each output file to 32 MiB, and disables
+  core dumps. The caller kills and reaps it after 30 s or on interruption. Inputs and
+  extracted UTF-8 text are limited to 32 MiB; encrypted PDFs, more than 300 pages and
+  documents without extractable text are rejected. Complex PDFs may exceed these limits;
+  supply reviewed Markdown/OCR instead. This is resource isolation, not a filesystem or
+  network sandbox: the worker still runs under your account. PDF extraction does not
+  establish visual review. The workspace writer lock remains held during import.
+  `report` reads state without the writer lock, so a concurrent writer can make one report slightly stale.
 - `project_benefit` compares measured values with independently declared numeric expectations. Alongside
   candidate-only guards (`op` and `value`), paired guards accept `metric`, `direction`
   (`higher_is_better` or `lower_is_better`), and `unit`. Both arms need numeric expectations.

@@ -22,6 +22,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install pinned PDF parser for resource-boundary regressions
+        run: python3 -m pip install '.[pdf]'
       - name: Run the offline self-test
         run: python3 -m paper2project selftest
       - name: Run security regression tests

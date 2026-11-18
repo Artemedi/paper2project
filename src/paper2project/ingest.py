@@ -4,7 +4,6 @@ from __future__ import annotations
 from html.parser import HTMLParser
 import http.client
 import hashlib
-import io
 from pathlib import Path
 import ipaddress
 import json
@@ -14,6 +13,7 @@ import urllib.parse
 import urllib.request
 
 from .store import digest, identifier, now, regular_file, slug
+from .pdf import extract as extract_pdf
 
 MAX_FILE = 32 * 1024 * 1024
 MAX_MEMORY = 16 * 1024 * 1024
@@ -246,16 +246,7 @@ def import_research(store,source,title=None,research_id=None,origin=None):
     original=store.put(raw)
     limits=[]
     if raw.startswith(b"%PDF-"):
-        try:
-            from pypdf import PdfReader
-        except ImportError as exc:
-            raise ValueError("Install the distribution's pypdf dependency to import PDFs") from exc
-        reader=PdfReader(io.BytesIO(raw))
-        if reader.is_encrypted: raise ValueError("Encrypted research PDF is not supported")
-        if len(reader.pages)>300: raise ValueError("PDF exceeds300 pages")
-        pages=[(page.extract_text() or "").replace("\0","\ufffd") for page in reader.pages]  # extractors can emit NUL
-        if not any(p.strip() for p in pages): raise ValueError("PDF has no extractable text; supply reviewed Markdown/OCR")
-        text="\n\n".join(f"# PDF page {i+1}\n{page}" for i,page in enumerate(pages))
+        text=extract_pdf(raw)
         coverage="TEXT_EXTRACTED_NOT_VISUALLY_REVIEWED"
         limits=["Formatting, figures, equations, tables and separate supplements require source review."]
     elif "html" in content_type or raw.lstrip().lower().startswith((b"<!doctype html",b"<html")):

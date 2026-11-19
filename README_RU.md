@@ -75,6 +75,8 @@ python3 -m venv .venv
 | 🟡 `BENEFIT_CRITERIA_MET` | Заявленные пороги пройдены. | Проверить метод, целевые данные и зафиксированный эталон каждого эксперимента. |
 | 🟢 `BENEFIT_DEMONSTRATED` | Сравнение и независимая проверка прошли на заявленных данных. | Оценить, насколько эти данные представляют рабочие условия, прежде чем внедрять изменение. |
 
+Полный список статусов проекта (включая `NO_ANALYSIS`, `APPLICABILITY_PENDING_REVIEW`, `APPLICABILITY_CONFLICT`, `FINDINGS_PENDING_REVIEW`, `FINDINGS_REVIEWED`, `MIXED_EVIDENCE`, `STALE`, `STALE_EVIDENCE` и `EXPERIMENT_INCOMPLETE`) см. в [docs/product/README.md](docs/product/README.md).
+
 > [!TIP]
 > Зафиксируйте критерии до запуска. Политика повторных отправок может сократить дубли
 > и провалить проверку пользы, если выросло число пропусков, а критерий запрещает потери.

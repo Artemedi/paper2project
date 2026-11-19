@@ -73,6 +73,8 @@ rejects an invalid quotation and verifies that the default export omits raw proj
 | 🟡 `BENEFIT_CRITERIA_MET` | The declared thresholds passed. | Verify the method, target data and frozen reference for each benefit experiment. |
 | 🟢 `BENEFIT_DEMONSTRATED` | The comparison and independent review passed on the declared inputs. | Assess whether those inputs are representative before adopting the change. |
 
+See [docs/product/README.md](docs/product/README.md) for the complete list of project statuses (including `NO_ANALYSIS`, `APPLICABILITY_PENDING_REVIEW`, `APPLICABILITY_CONFLICT`, `FINDINGS_PENDING_REVIEW`, `FINDINGS_REVIEWED`, `MIXED_EVIDENCE`, `STALE`, `STALE_EVIDENCE`, and `EXPERIMENT_INCOMPLETE`).
+
 > [!TIP]
 > Set acceptance criteria before running. A retry policy can reduce duplicates and still fail
 > the benefit test if the no-loss guard rejects an increase in missed deliveries.

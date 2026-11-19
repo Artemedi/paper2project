@@ -51,11 +51,15 @@ def main():
                 raise SystemExit("Refusing symlink: " + str(path))
             relative = path.relative_to(ROOT).as_posix()
             info = zipfile.ZipInfo(prefix + relative, (2026, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16
             data = path.read_bytes()
             archive.writestr(info, data)
             inventory[relative] = hashlib.sha256(data).hexdigest()
-        archive.writestr(zipfile.ZipInfo(prefix + "MANIFEST.json", (2026, 1, 1, 0, 0, 0)), json.dumps(inventory, indent=2, sort_keys=True))
+        manifest_info = zipfile.ZipInfo(prefix + "MANIFEST.json", (2026, 1, 1, 0, 0, 0))
+        manifest_info.compress_type = zipfile.ZIP_DEFLATED
+        manifest_info.external_attr = 0o644 << 16
+        archive.writestr(manifest_info, json.dumps(inventory, indent=2, sort_keys=True))
     print(json.dumps({"path": str(destination), "files": len(inventory), "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
                       "bytes": destination.stat().st_size}, indent=2))
 

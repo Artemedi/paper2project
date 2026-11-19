@@ -9,6 +9,7 @@ import sys
 
 from . import __version__, execution, model
 from .core import App
+from .store import loads
 
 
 def default_workspace():
@@ -162,19 +163,19 @@ def run(args):
         if not args.yes_send:
             raise ValueError("Analysis sends project and research text to the endpoint; repeat with --yes-send to confirm")
         endpoint = model.Endpoint(args.base_url, args.model, args.key_env)
-        print(f"Sending snapshot text to {endpoint.host} (model {endpoint.model})", file=sys.stderr)
-        return model.analyze(app, args.job_id, endpoint, args.query)
+        return model.analyze(app, args.job_id, endpoint, args.query,
+                             on_send=lambda ep: print(f"Sending snapshot text to {ep.host} (model {ep.model})", file=sys.stderr))
     if c == "submit-analysis":
-        return app.submit_analysis(args.job_id, json.loads(Path(args.file).read_text()), args.author)
+        return app.submit_analysis(args.job_id, loads(Path(args.file).read_text(encoding="utf-8")), args.author)
     if c == "review":
         return app.review_analysis(args.job_id, args.decision, args.notes, args.reviewer, args.analysis, args.project, args.evidence, args.verify_experiment)
     if c == "review-packet":
         return app.review_packet(args.job_id, args.project, blind=args.blind)
     if c == "review-finding":
-        return app.review_finding(args.job_id, args.project, json.loads(Path(args.file).read_text()))
+        return app.review_finding(args.job_id, args.project, loads(Path(args.file).read_text(encoding="utf-8")))
     if c == "experiment":
         if a == "add":
-            return app.add_experiment(args.job_id, json.loads(Path(args.plan).read_text()))
+            return app.add_experiment(args.job_id, loads(Path(args.plan).read_text(encoding="utf-8")))
         if a == "run":
             return app.run_experiment(args.job_id, args.experiment_id)
         return app.experiments(args.job_id)

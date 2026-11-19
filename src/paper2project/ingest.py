@@ -12,7 +12,8 @@ import time
 import urllib.parse
 import urllib.request
 
-from .store import digest, identifier, now, regular_file, slug
+from . import __version__
+from .store import digest, identifier, loads, now, regular_file, slug
 from .pdf import extract as extract_pdf
 
 MAX_FILE = 32 * 1024 * 1024
@@ -132,6 +133,7 @@ def import_projects(store, source, layout="auto", name=None, project_id=None):
 def check_address(address,hostname):
     """Refuse non-public destinations; applied to every address actually used for a connection."""
     ip = ipaddress.ip_address(address.split("%")[0])
+    hostname = hostname.lower()
     fake_ip = ip in ipaddress.ip_network("198.18.0.0/15") and hostname in {
         "arxiv.org", "www.nature.com", "idp.nature.com", "static-content.springer-cdn.com",
         "raw.githubusercontent.com", "github.com"}
@@ -169,7 +171,11 @@ class PinnedHTTPSConnection(http.client.HTTPSConnection):
                 last = exc
         else:
             raise last or OSError("no address to connect to")
-        self.sock = self._context.wrap_socket(sock,server_hostname=self.host)
+        try:
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        except BaseException:
+            sock.close()
+            raise
 
 
 class PinnedHTTPS(urllib.request.HTTPSHandler):
@@ -198,7 +204,7 @@ def read_http_limited(response, max_bytes, deadline):
             return bytes(content)
         content.extend(block)
         if len(content) > max_bytes:
-            raise ValueError("Research download exceeds32MiB")
+            raise ValueError("Research download exceeds 32 MiB")
 
 
 class TextHTML(HTMLParser):
@@ -220,20 +226,30 @@ def import_research(store,source,title=None,research_id=None,origin=None):
     if location.startswith(("https://","http://")):
         deadline = time.monotonic() + 90
         public_url(location)
-        request=urllib.request.Request(location,headers={"User-Agent":"Paper2Project/0.1"})
-        with urllib.request.build_opener(urllib.request.ProxyHandler({}),Redirect(),PinnedHTTPS()).open(request,timeout=30) as response:
-            public_url(response.url)
-            raw=read_http_limited(response, MAX_FILE, deadline)
-            content_type=response.headers.get_content_type()
-            charset=response.headers.get_content_charset() or "utf-8"
-        if len(raw)>MAX_FILE: raise ValueError("Research download exceeds32MiB")
-        url_parts=urllib.parse.urlsplit(location)
-        requested_pdf=(url_parts.path.lower().endswith(".pdf")
-                       or (url_parts.hostname=="arxiv.org" and url_parts.path.startswith("/pdf/"))
-                       or content_type=="application/pdf")
+        request = urllib.request.Request(location, headers={"User-Agent": f"Paper2Project/{__version__}"})
+        with urllib.request.build_opener(urllib.request.ProxyHandler({}), Redirect(), PinnedHTTPS()).open(request, timeout=30) as response:
+            final_url = response.url
+            public_url(final_url)
+            raw = read_http_limited(response, MAX_FILE, deadline)
+            content_type = response.headers.get_content_type()
+            charset = response.headers.get_content_charset() or "utf-8"
+        if len(raw) > MAX_FILE:
+            raise ValueError("Research download exceeds 32 MiB")
+        url_parts = urllib.parse.urlsplit(location)
+        final_parts = urllib.parse.urlsplit(final_url)
+        requested_pdf = (
+            any(
+                parts.path.lower().endswith(".pdf")
+                or (parts.hostname == "arxiv.org" and parts.path.startswith("/pdf/"))
+                for parts in (url_parts, final_parts)
+            )
+            or content_type == "application/pdf"
+        )
         if requested_pdf and not raw.startswith(b"%PDF-"):
             raise ValueError("PDF source returned non-PDF content; possible access or CAPTCHA page")
-        filename=Path(url_parts.path).name or "research"
+        filename = Path(final_parts.path).name or Path(url_parts.path).name
+        if filename in {"", ".", ".."}:
+            filename = "research"
     else:
         path=plain_path(location)
         if path.is_dir():
@@ -241,9 +257,8 @@ def import_research(store,source,title=None,research_id=None,origin=None):
             return _research_record(store,rid,title or path.name,docs,origin or "local-reviewed-package",{"coverage":"IMPORTED_PACKAGE_REVIEW_NOT_ATTESTED"},bool(research_id))
         with regular_file(path) as stream:
             raw = stream.read(MAX_FILE + 1)
-        if len(raw) > MAX_FILE: raise ValueError("Research file missing or exceeds32MiB")
+        if len(raw) > MAX_FILE: raise ValueError("Research file missing or exceeds 32 MiB")
         filename=path.name;content_type="";charset="utf-8"
-    original=store.put(raw)
     limits=[]
     if raw.startswith(b"%PDF-"):
         text=extract_pdf(raw)
@@ -258,8 +273,11 @@ def import_research(store,source,title=None,research_id=None,origin=None):
         coverage="HTML_TEXT_ONLY";limits=["HTML text extraction may omit figures, tables and supplementary material."]
     else:
         text=raw.decode("utf-8-sig");coverage="PROVIDED_TEXT_COMPLETENESS_UNATTESTED"
-    if len(text.encode())>MAX_FILE or "\0" in text: raise ValueError("Invalid or oversized research text")
-    doc={"id":"research:"+rid+":"+filename,"path":filename,"sha256":original,"text":store.put(text.encode()),"lines":len(text.splitlines()),"kind":"research"}
+    text_bytes = text.encode()
+    if len(text_bytes) > MAX_FILE or "\0" in text:
+        raise ValueError("Invalid or oversized research text")
+    original = store.put(raw)
+    doc={"id":"research:"+rid+":"+filename,"path":filename,"sha256":original,"text":store.put(text_bytes),"lines":len(text.splitlines()),"kind":"research"}
     return _research_record(store,rid,title or filename,[doc],origin or (location if location.startswith("https://") else "local-file"),{"coverage":coverage,"limitations":limits},bool(research_id))
 
 
@@ -295,10 +313,10 @@ def import_reviewed_package(store, package, research_id, title, origin, qualific
     """Accept artifacts from the local Paper2Agent verifier, checking their pinned bytes."""
     try:
         captured, records = qualification["captured"], qualification["records"]
-        report = json.loads(captured["verification.json"])
-        review = json.loads(captured["independent-review.json"])
-        manifest = json.loads(captured["source-manifest"])
-        build = json.loads(captured["build.json"])
+        report = loads(captured["verification.json"])
+        review = loads(captured["independent-review.json"])
+        manifest = loads(captured["source-manifest"])
+        build = loads(captured["build.json"])
         fingerprint = digest(json.dumps(records, sort_keys=True).encode())
         valid = (
             all(digest(captured[name]) == records[name] for name in ("verification.json", "source-manifest", "build.json"))
@@ -338,7 +356,6 @@ def import_reviewed_package(store, package, research_id, title, origin, qualific
                      and Path(name).suffix.lower() in {".md", ".markdown", ".txt"}}
     if expected_docs != {doc["path"]: doc["sha256"] for doc in docs}:
         raise ValueError("Paper2Agent package text changed after qualification")
-    validate_handoff_size(path for path, _, _ in sources)
     raw_sources = []
     total = 0
     for path, role, expected in sources:

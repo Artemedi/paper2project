@@ -85,7 +85,8 @@ def export_redactor(root, experiments, snapshots):
     ) + r""")(?=/|$|[^\w.-])(?:/[^\s"'<>;`]+)?""")
     basenames.discard("")
     names = (re.compile(r"artifact:(?:source|input|document):[0-9a-f]{16}|workspace:local|host-path:redacted|"
-                        r"(?P<name>(?<![\w.-])(?:" + "|".join(map(re.escape, sorted(basenames))) + r")(?![\w.-]))")
+                        r"(?P<name>(?<![\w.-])(?:" + "|".join(
+                            map(re.escape, sorted(basenames, key=lambda name: (-len(name), name)))) + r")(?![\w.-]))")
              if basenames else None)
 
     def redact(value, field=None):
@@ -93,7 +94,8 @@ def export_redactor(root, experiments, snapshots):
             value = HOST_PATH.sub("host-path:redacted", paths.sub(lambda match: aliases[match[1]], value))
             if names and field in (None, "arms", "summary", "rationale", "claim", "quote", "notes", "reason", "error",
                                     "missing_evidence", "expected", "actual", "output_files", "origin", "explanation",
-                                    "baseline", "candidate", "name", "title"):
+                                    "baseline", "candidate", "name", "title", "target", "premise", "falsifier",
+                                    "data", "comparison"):
                 return names.sub(lambda m: ("local-name:redacted" + "".join(re.findall(r"\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]", m["name"]))
                                             if m["name"] else m[0]), value)
             return value
@@ -172,18 +174,21 @@ class App:
         if len(payload)>8*1024*1024:
             raise ValueError("Project asset must be a regular file <=8MiB")
         asset_name=name or path.name
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}",asset_name): raise ValueError("Unsafe asset name")
+        if not isinstance(asset_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}", asset_name):
+            raise ValueError("Unsafe asset name")
         snap=self.store.json(current["snapshot"])
         assets=snap.setdefault("assets",{})
         assets[asset_name]={"name":asset_name,"sha256":self.store.put(payload),"bytes":len(payload)}
-        current.update(snapshot=self.store.put_json(snap),revision=current["revision"]+1,updated_at=now())
+        new_snapshot=self.store.put_json(snap)
+        current.update(snapshot=new_snapshot,revision=current["revision"]+(new_snapshot!=current["snapshot"]),updated_at=now())
         self.store.save("project",project_id,current)
         return current
 
     @writer
     def create_job(self,research_id,project_ids):
-        if not isinstance(project_ids,list) or not project_ids or len(set(project_ids))!=len(project_ids) or len(project_ids)>100:
-            raise ValueError("Select1..100 distinct projects")
+        if (not isinstance(project_ids, list) or not project_ids or len(project_ids) > 100
+                or not all(isinstance(p, str) for p in project_ids) or len(set(project_ids)) != len(project_ids)):
+            raise ValueError("Select 1..100 distinct projects")
         research=self.store.get("research",research_id)
         projects=[self.store.get("project",p) for p in project_ids]
         job={"id":unique("job"),"created_at":now(),"research":research,"projects":projects,"analysis":None,"review":None,"experiments":[]}
@@ -199,14 +204,14 @@ class App:
                 for snap in self.snapshots(job) for d in snap["documents"]}
 
     def read(self,job_id,document_id,start=1,count=80):
-        if type(start)is not int or start<1 or type(count)is not int or not 1<=count<=300: raise ValueError("start positive, count1..300")
+        if type(start)is not int or start<1 or type(count)is not int or not 1<=count<=300: raise ValueError("start positive, count 1..300")
         docs=self.docs(job_id)
         if document_id not in docs: raise ValueError("Document is not part of this job")
         doc=docs[document_id];lines=self.store.blob(doc["text"]).decode().splitlines()
         return {"document":doc,"start":start,"end":min(len(lines),start+count-1),"text":"\n".join(f"{i+1}: {line}" for i,line in enumerate(lines) if start<=i+1<start+count)}
 
     def context(self,job_id,query="",max_chars=100000):
-        if type(max_chars)is not int or not 1000<=max_chars<=400000: raise ValueError("max_chars must be1000..400000")
+        if type(max_chars)is not int or not 1000<=max_chars<=400000: raise ValueError("max_chars must be 1000..400000")
         docs=self.docs(job_id)
         words=set(re.findall(r"\w+",query.casefold()))
         chunks=[]
@@ -408,12 +413,15 @@ class App:
             assets = self.store.json(project["snapshot"]).get("assets", {})
             observation = findings.artifact_anchor(observation, assets, self.store.blob)
             if not item["project_artifacts"] or any(
-                    ref["sha256"] == observation["sha256"] or ref["quote"] == observation["quote"]
+                    ref["sha256"] == observation["sha256"] or ref["quote"].strip() == observation["quote"].strip()
                     for ref in item["project_artifacts"]):
                 raise ValueError("Second observation needs another attached artifact and different quoted evidence")
         value = {"finding_id": fid, "analysis": job["analysis"], "evidence": expected,
                  "project_id": packet["project_id"], "reviewer": reviewer.strip(), "premise": premise,
-                 "test_link": link, "plan_hash": plan_hash, "notes": notes.strip(), "second_observation": observation,
+                 "test_link": link,
+                 "experiment_id": binding["experiment_id"] if binding else None,
+                 "plan_hash": binding["plan_hash"] if binding else None,
+                 "notes": notes.strip(), "second_observation": observation,
                  "independence_basis": independence.strip() if independence else None, "created_at": now()}
         reviews = job.setdefault("finding_reviews", {}).setdefault(packet["project_id"], {})
         previous = self.store.json(reviews[fid]) if fid in reviews else {}
@@ -500,6 +508,9 @@ class App:
         if job["review"]:self.store.json(job["review"])
         for key in job.get("reviews", {}).values():
             self.store.json(key)
+        for project_reviews in job.get("finding_reviews", {}).values():
+            for key in project_reviews.values():
+                self.store.json(key)
         # Reviews have per-project evidence scopes. The report derives whether they are current.
         state = "STALE" if stale else "ANALYZED" if job["analysis"] else "CREATED"
         return {**job, "stale": stale, "state": state}
@@ -610,8 +621,9 @@ class App:
             if history and history[-1]["content_sha256"]==content_sha:
                 records.append(self._decision(history[-1]));continue
             previous=history[-1]["object"] if history else None
-            key=self.store.put_json({**content,"previous":previous,"recorded_at":now(),"content_sha256":content_sha})
-            row={"job_id":job_id,"project_id":p["project_id"],"object":key,"content_sha256":content_sha,"previous":previous,"recorded_at":now()}
+            recorded_at=now()
+            key=self.store.put_json({**content,"previous":previous,"recorded_at":recorded_at,"content_sha256":content_sha})
+            row={"job_id":job_id,"project_id":p["project_id"],"object":key,"content_sha256":content_sha,"previous":previous,"recorded_at":recorded_at}
             self.store.save("decision","d-"+key[:40],row)
             records.append(self._decision(row))
         return records
@@ -629,7 +641,11 @@ class App:
             if len(heads)!=1 or any(len(v)!=1 for v in children.values()) or any(k not in mine for k in children):
                 raise ValueError("Decision history is not a single chain for project "+pid)
             row=heads[0]
+            seen=set()
             while row is not None:
+                if row["object"] in seen:
+                    raise ValueError("Decision history has a cycle for project " + pid)
+                seen.add(row["object"])
                 ordered.append(row)
                 nxt=children.get(row["object"])
                 row=nxt[0] if nxt else None
@@ -678,7 +694,7 @@ class App:
                     review = self.store.json(key)
                     observation = review.get("second_observation")
                     scoped_reviews[key] = {field: review.get(field) for field in
-                                           ("project_id", "finding_id", "analysis", "evidence", "premise", "test_link", "plan_hash")}
+                                           ("project_id", "finding_id", "analysis", "evidence", "premise", "test_link", "experiment_id", "plan_hash")}
                     scoped_reviews[key]["second_observation"] = (
                         {field: observation[field] for field in ("sha256", "start", "end")} if observation else None)
                     scoped_reviews[key]["test_reviews"] = {

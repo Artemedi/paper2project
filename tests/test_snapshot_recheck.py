@@ -73,6 +73,10 @@ class SnapshotRecheck(unittest.TestCase):
         stored = self.app.store.get("run", run["id"])
         self.assertEqual(set(stored["arms"]), {"baseline"})
         self.assertEqual(self.app.store.json(stored["arms"]["baseline"]["result"]), {"metric": 1})
+        evaluated = execution.evaluate(self.app, stored)
+        self.assertEqual(evaluated["status"], "BLOCKED")
+        self.assertIn(reason, evaluated["reason"])
+        self.assertEqual(self.app.experiments(self.job)[0]["runs"][0]["score_status"], "BLOCKED")
 
     def test_source_change_blocks_candidate(self):
         self.check_change("source_path", "code.py", "Source tree changed")

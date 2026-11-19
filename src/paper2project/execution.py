@@ -90,9 +90,10 @@ def bounded_tree(root):
 
 def tree_hash(path):
     """Deterministic hash of everything the container can see: names, modes, content, .git included."""
-    root = Path(path)
-    if root.is_symlink() or not root.is_dir():
+    raw_root = Path(path)
+    if raw_root.is_symlink() or not raw_root.is_dir():
         raise ValueError("Experiment tree must be a real directory: " + str(path))
+    root = raw_root.resolve()
     entries, total = [], 0
     for item in bounded_tree(root):
         relative = item.relative_to(root).as_posix()
@@ -113,12 +114,41 @@ def tree_hash(path):
     return {"sha256": digest(dumps(entries).encode("utf-8", "surrogatepass")), "files": len(entries), "bytes": total}
 
 
+def _rmtree_writable(path):
+    """Make snapshot directories writable before removing a failed tree."""
+    root = Path(path)
+    if not root.is_symlink():
+        if root.is_dir():
+            try:
+                os.chmod(root, 0o700)
+            except OSError:
+                pass
+        for dirpath, dirnames, _ in os.walk(root, topdown=True, followlinks=False):
+            current = Path(dirpath)
+            if not current.is_symlink():
+                try:
+                    os.chmod(current, 0o700)
+                except OSError:
+                    pass
+            for name in dirnames:
+                child = current / name
+                if not child.is_symlink():
+                    try:
+                        os.chmod(child, 0o700)
+                    except OSError:
+                        pass
+    shutil.rmtree(root, ignore_errors=True)
+
+
 def copy_tree(source, destination, expected):
     """Copy a hashed tree into the workspace and prove the copy has exactly the hash that was registered.
 
     The container later mounts only the copy, so the live directory can no longer change what runs after it was hashed.
     Files are opened without following symlinks; modes are reproduced because they are part of the hash."""
-    source, destination = Path(source), Path(destination)
+    raw_source = Path(source)
+    if raw_source.is_symlink() or not raw_source.is_dir():
+        raise ValueError("Experiment tree must be a real directory: " + str(source))
+    source, destination = raw_source.resolve(), Path(destination)
     destination.mkdir(parents=True, mode=0o700)
     directories = []
     copied = 0
@@ -145,10 +175,7 @@ def copy_tree(source, destination, expected):
         if tree_hash(destination)["sha256"] != expected["sha256"]:
             raise ValueError("Experiment tree changed while it was being copied; register again from a quiet directory")
     except BaseException:
-        for target, _ in directories:
-            os.chmod(target, 0o700)
-        os.chmod(destination, 0o700)
-        shutil.rmtree(destination, ignore_errors=True)
+        _rmtree_writable(destination)
         raise
     return destination
 
@@ -199,8 +226,12 @@ def git_head(source, *, local=None):
                 found = value.strip()
             else:
                 for line in (read(common / "packed-refs", common, 8 << 20) or "").splitlines():
-                    if line.endswith(" " + ref):
-                        found = line.split()[0]
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith(("#", "^")):
+                        continue
+                    parts = stripped.split(" ", 1)
+                    if len(parts) == 2 and parts[1] == ref:
+                        found = parts[0]
         return found if found and re.fullmatch(r"[0-9a-f]{40}", found) else None
     except (OSError, UnicodeError, ValueError, RuntimeError):
         return None
@@ -230,15 +261,16 @@ def extract(value, path):
 def matches(actual, expected, comparison, tolerance):
     if comparison == "exact":
         return strict_equal(actual, expected)
-    numbers = (isinstance(actual, (int, float)) and not isinstance(actual, bool)
-               and isinstance(expected, (int, float)) and not isinstance(expected, bool))
-    if not numbers or not number(actual) or not number(expected):
+    if not (number(actual) and number(expected) and number(tolerance) and tolerance >= 0):
         return False
     try:
-        bound = tolerance if comparison == "abs" else tolerance * abs(expected)
-        spread = abs(actual - expected)
-        return math.isfinite(bound) and math.isfinite(spread) and spread <= bound  # inf <= inf must not pass
-    except OverflowError:
+        tol = Fraction(str(tolerance))
+        exp = Fraction(str(expected))
+        act = Fraction(str(actual))
+        bound = tol if comparison == "abs" else tol * abs(exp)
+        spread = abs(act - exp)
+        return spread <= bound
+    except (OverflowError, ValueError):
         return False
 
 
@@ -373,11 +405,14 @@ def validate_plan(plan, project_ids):
         target = next((m for m in metrics if m["name"] == benefit.get("metric")), None)
         if target is None or set(target["expected"]) != set(ARMS) or not number(target["expected"]["baseline"]) or not number(target["expected"]["candidate"]):
             raise ValueError("Benefit metric must be numeric with independent expected values for both arms")
-        slack = 0.0
+        slack = Fraction(0)
         if target.get("comparison", "exact") != "exact":  # a loose tolerance would let any number "match" the expectation
-            scale = 1 if target["comparison"] == "abs" else max(abs(target["expected"]["baseline"]), abs(target["expected"]["candidate"]))
-            slack = target["tolerance"] * scale
-        if 2 * slack >= benefit["min_delta"]:
+            scale = Fraction(1) if target["comparison"] == "abs" else max(
+                abs(Fraction(str(target["expected"]["baseline"]))),
+                abs(Fraction(str(target["expected"]["candidate"]))),
+            )
+            slack = Fraction(str(target["tolerance"])) * scale
+        if 2 * slack >= Fraction(str(benefit["min_delta"])):
             raise ValueError("Benefit metric tolerance must be below half of min_delta")
         for guard in benefit["guards"]:
             if not isinstance(guard, dict) or not isinstance(guard.get("metric"), str) or guard["metric"] not in names:
@@ -453,15 +488,12 @@ def add_experiment(app, job_id, plan):
     snapshot_dir = app.store.root / "snapshots" / experiment_id
     source_copy = copy_tree(source, snapshot_dir / "source", source_tree)
     if head is not None and git_head(source, local=app.local) != head:
-        shutil.rmtree(snapshot_dir)
+        _rmtree_writable(snapshot_dir)
         raise ValueError("Source Git revision changed during registration")
     try:
         inputs = copy_tree(inputs, snapshot_dir / "input", input_tree) if inputs else None
     except BaseException:
-        for directory in [source_copy, *source_copy.rglob("*")]:
-            if directory.is_dir():
-                directory.chmod(0o700)
-        shutil.rmtree(snapshot_dir)
+        _rmtree_writable(snapshot_dir)
         raise
     entry = {"id": experiment_id, "job_id": job_id, "project_id": plan["project_id"], "kind": plan["kind"],
              "plan": app.store.put_json(plan), "created_at": now(), "head_matches": head is not None, "analysis": job["analysis"],
@@ -495,9 +527,10 @@ def evaluate(app, run):
         status = run.get("status")
         return {**run, "status": status if status in {"BLOCKED", "RUNNING", "INTERRUPTED"} else "FAIL"}
     if not run.get("sealed"):  # facts that decide the verdict must come from a hashed object, not from an editable row
-        if run.get("status") in {"RUNNING", "INTERRUPTED"}:
-            return {**run, "reproduced": False, "benefit": None}  # partial arms cannot establish PASS
-        return {**run, "status": "FAIL", "reproduced": False, "benefit": None, "reason": "run has no sealed arm facts"}
+        if run.get("status") in {"BLOCKED", "RUNNING", "INTERRUPTED"}:
+            return {**run, "checks": [], "reproduced": False, "benefit": None}  # partial arms cannot establish PASS
+        return {**run, "status": "FAIL", "checks": [], "reproduced": False, "benefit": None,
+                "reason": run.get("reason") if run.get("status") == "FAIL" and run.get("reason") else "run has no sealed arm facts"}
     seal = app.store.json(run["sealed"])  # rehashed on read
     if seal.get("schema") != 2:
         return {**run, "status": "STALE", "checks": [], "reproduced": False, "benefit": None,
@@ -559,24 +592,24 @@ def collect(record, out, stdout, stderr):
     record["stdout"], record["stderr"] = read_log(stdout), read_log(stderr)
     record["stdout_sha256"], record["stderr_sha256"] = file_digest(stdout), file_digest(stderr)
     files, entries = {}, 0
-    root_fd = os.open(out, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    root_fd = os.open(out, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         pinned = os.fstat(root_fd)
         for directory, folders, names, descriptor in os.fwalk(".", dir_fd=root_fd, follow_symlinks=False):
             for name in folders + names:
                 entries += 1
                 if entries > MAX_OUTPUT_ENTRIES:
-                    record["error"] = "Output has more than 1000 entries"
+                    record["error"] = record["error"] or "Output has more than 1000 entries"
                     break
                 relative = (Path(directory) / name).as_posix()
                 info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
                 if stat.S_ISDIR(info.st_mode):
                     continue
                 if not stat.S_ISREG(info.st_mode):
-                    record["error"] = "Output contains a symlink or special file: " + relative
+                    record["error"] = record["error"] or ("Output contains a symlink or special file: " + relative)
                     continue
                 hasher, size = hashlib.sha256(), 0
-                with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
                                       dir_fd=descriptor), "rb") as stream:
                     if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                         raise ValueError("Output entry changed to a special file: " + relative)
@@ -587,7 +620,7 @@ def collect(record, out, stdout, stderr):
                         hasher.update(block)
                 if size > MAX_OUTPUT_FILE:
                     files[relative] = None
-                    record["error"] = f"Output file {relative} exceeds {MAX_OUTPUT_FILE} bytes"
+                    record["error"] = record["error"] or f"Output file {relative} exceeds {MAX_OUTPUT_FILE} bytes"
                 else:
                     files[relative] = hasher.hexdigest()
             if entries > MAX_OUTPUT_ENTRIES:
@@ -600,7 +633,7 @@ def collect(record, out, stdout, stderr):
         if (current.st_dev, current.st_ino) != (pinned.st_dev, pinned.st_ino):
             raise ValueError("Output root changed during collection")
         if record["exit_code"] == 0 and not record["error"]:
-            with os.fdopen(os.open("result.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            with os.fdopen(os.open("result.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
                                   dir_fd=root_fd), "rb") as stream:
                 if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                     raise ValueError("result.json must be a regular file")
@@ -726,7 +759,7 @@ def output_breach(stdout, stderr, out, pids=()):
 
     # Pin the output root itself: fwalk(path) silently skips a symlink at its root.
     try:
-        root_fd = os.open(out, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        root_fd = os.open(out, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
         return "output directory is missing or unsafe"
     try:
@@ -872,6 +905,9 @@ raise SystemExit(client.returncode)
                 while True:
                     try:
                         record["exit_code"] = proc.wait(timeout=POLL_SECONDS)
+                        if write_fd is not None:
+                            os.close(write_fd)
+                            write_fd = None
                         if record["exit_code"] != 0:
                             remove_container(name)
                         break
@@ -1182,9 +1218,9 @@ def outcome_for_job(app, job, run_histories=None):
             attested = reviewed and benefit_ids <= set(review.get("verified_experiments", []))
             if not met:
                 decision, why = "REPRODUCED_BENEFIT_UNPROVEN", "The source reproduced as declared, but not every project_benefit experiment met its declared criteria (or none exists). Reproduction does not prove utility."
-            elif assessment["relevance"] == "findings_only" and not (attested and benefit_ids <= scoped_support):
+            elif assessment["relevance"] == "findings_only" and not (benefit_ids <= scoped_support):
                 decision = "FINDINGS_REVIEWED" if scoped_reviewed else "FINDINGS_PENDING_REVIEW"
-                why = "A project-level passing experiment does not establish benefit for individual findings."
+                why = "Each passing benefit experiment requires a passing scoped premise and relevant test-link review before project benefit can be established."
             elif assessment["relevance"] == "not_applicable":
                 decision, why = "APPLICABILITY_CONFLICT", "The declared benefit passed and conflicts with the analysis rejection; revise the assessment before drawing a conclusion."
             elif attested:

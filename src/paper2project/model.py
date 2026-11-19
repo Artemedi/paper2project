@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -36,15 +37,19 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 class Endpoint:
     def __init__(self, base_url, model, key_env="PAPER2PROJECT_API_KEY", timeout=120):
-        parsed = urllib.parse.urlsplit(base_url or "")
+        raw_url = base_url if isinstance(base_url, str) else ""
+        parsed = urllib.parse.urlsplit(raw_url)
         local = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
         if parsed.scheme not in {"https", "http"} or not parsed.hostname or parsed.username or parsed.password \
+                or parsed.query or parsed.fragment or "?" in raw_url or "#" in raw_url \
                 or (parsed.scheme == "http" and not local):
-            raise ValueError("Base URL must be https (http only for localhost) without embedded credentials")
-        if not model:
+            raise ValueError("Base URL must be https (http only for localhost) without embedded credentials, query or fragment")
+        if not isinstance(model, str) or not model.strip():
             raise ValueError("A model name is required; none is assumed")
-        self.url = base_url.rstrip("/") + "/chat/completions"
-        self.host, self.model, self.key_env, self.timeout = parsed.hostname, model, key_env, timeout
+        if not isinstance(key_env, str) or not key_env.strip():
+            raise ValueError("An API key environment variable name is required")
+        self.url = raw_url.rstrip("/") + "/chat/completions"
+        self.host, self.model, self.key_env, self.timeout = parsed.hostname, model.strip(), key_env.strip(), timeout
 
     def complete(self, messages):
         key = os.environ.get(self.key_env)
@@ -74,7 +79,8 @@ class Endpoint:
                         raise ValueError("Model response exceeds 4 MiB")
                 raw = bytes(content)
         except urllib.error.HTTPError as exc:
-            raise ValueError(f"Model endpoint returned HTTP {exc.code}") from exc
+            suffix = " (redirect refused)" if exc.reason == "redirect refused" else ""
+            raise ValueError(f"Model endpoint returned HTTP {exc.code}{suffix}") from exc
         except (urllib.error.URLError, OSError) as exc:
             raise ValueError("Model endpoint unreachable: " + str(getattr(exc, "reason", exc))) from exc
         if len(raw) > MAX_RESPONSE:
@@ -89,8 +95,9 @@ def parse_json(text):
     if not isinstance(text, str):
         raise ValueError("Model reply has no text content")
     text = text.strip()
-    if text.startswith("```"):
-        text = text.strip("`").removeprefix("json").strip()
+    m = re.fullmatch(r"```[A-Za-z0-9_-]*\s*\n(.*?)\n?```", text, re.S)
+    if m:
+        text = m.group(1).strip()
     try:
         value = loads(text)
     except ValueError as exc:
@@ -100,12 +107,16 @@ def parse_json(text):
     return value
 
 
-def analyze(app, job_id, endpoint, query="", max_chars=60000, attempts=3):
+def analyze(app, job_id, endpoint, query="", max_chars=60000, attempts=3, on_send=None):
     """Submit the model's grounded analysis; validation errors are fed back, never bypassed."""
     context = app.context(job_id, query, max_chars)
+    if context["job"]["stale"]:
+        raise ValueError("Job is stale: " + ", ".join(context["job"]["stale"]) + "; create a new job from current memories")
     if context["truncated"]:
         raise ValueError(f"Standalone analysis would omit {context['omitted_chunks']} source chunks. "
                          "Read the complete evidence through MCP document_read or prepare and submit a reviewed analysis.")
+    if on_send is not None:
+        on_send(endpoint)
     source = context["research_source"]
     messages = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": json.dumps({"projects": [p["id"] for p in context["job"]["projects"]],
@@ -120,6 +131,6 @@ def analyze(app, job_id, endpoint, query="", max_chars=60000, attempts=3):
             return app.submit_analysis(job_id, parse_json(reply), author=f"model:{endpoint.host}/{endpoint.model}")
         except ValueError as exc:
             error = exc
-            messages += [{"role": "assistant", "content": reply},
+            messages += [{"role": "assistant", "content": reply if isinstance(reply, str) else ""},
                          {"role": "user", "content": "The analysis was rejected: " + str(exc) + ". Return a corrected JSON object."}]
     raise ValueError("Model did not produce a valid grounded analysis: " + str(error))

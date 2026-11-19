@@ -32,6 +32,7 @@ State lives in a workspace directory (`--workspace`, `$PAPER2PROJECT_WORKSPACE`,
 paper2project project import ./memories                    # directory: one project per subdirectory/.md/.txt file
 paper2project project import ./CLAUDE.md --name "My app"  # single Markdown file
 paper2project research import ./paper.pdf --title "Paper"  # .md/.txt/.pdf/https URL/reviewed package directory
+# optional: paper2project project attach my-app ./artifact.json  # attach <=8 MiB evidence file before job creation
 paper2project job create --research paper --project my-app --project other-app
 paper2project job context JOB                              # line-numbered, citable chunks (untrusted data)
 paper2project analyze JOB --base-url https://HOST/v1 --model NAME --yes-send   # standalone mode
@@ -143,13 +144,13 @@ would omit chunks, standalone analysis stops before contacting the model. Read t
 ```
 
 Imports are limited to `--allow-root` directories (none given: all local imports denied). URL imports need
-`--allow-network`; container experiments need `--allow-execution`; `analysis_review` needs `--allow-review`, which is off by
-default so an agent confined to MCP cannot approve itself (use `paper2project review` from a separate session or person). This is
+`--allow-network`; container experiments need `--allow-execution`; `analysis_review` and `finding_review` need `--allow-review`, which is off by
+default so an agent confined to MCP cannot approve itself (use `paper2project review` or `paper2project review-finding` from a separate session or person). This is
 a gate on the MCP channel only: an agent with shell access to the same workspace can still run the CLI and name any reviewer, so the
 review records a declared human or separate-session identity. Keep analysis and review permissions separate.
-An explicitly matching analyst and reviewer name is refused. Tools: `projects`, `research`, `project_import`,
-`research_import`, `job_create`, `job_status`, `job_context`, `document_read`, `analysis_submit`, `review_packet`, `analysis_review`,
-`experiment_add`, `experiment_run`, `experiments`, `report`. This project does not edit any client configuration.
+An explicitly matching analyst and reviewer name is refused. Tools: `projects`, `research`, `jobs`, `project_import`,
+`project_attach`, `research_import`, `job_create`, `job_status`, `job_context`, `document_read`, `analysis_submit`, `review_packet`,
+`analysis_review`, `finding_review`, `experiment_add`, `experiment_run`, `experiments`, `report`. This project does not edit any client configuration.
 
 ## Experiments: reproduction versus project benefit
 
@@ -204,7 +205,8 @@ the run from an independent source** (hand calculation, published table, other i
 
 Project ids come from file or directory names; a name with letters outside a-z gets a short hash suffix. Names that differ only in case or punctuation (`My App`, `my-app`) share an id: re-importing one under the other is refused unless you pass an explicit project or research id.
 
-Project decisions in the report: `APPLICABILITY_PENDING_REVIEW`, `ANALYSIS_REVIEW_REQUIRED`,
+Project decisions in the report: `NO_ANALYSIS`, `APPLICABILITY_PENDING_REVIEW`, `APPLICABILITY_CONFLICT`,
+`ANALYSIS_REVIEW_REQUIRED`, `FINDINGS_PENDING_REVIEW`, `FINDINGS_REVIEWED`,
 `NOT_APPLICABLE`, `ANALYSIS_ONLY`, `EXPERIMENT_NOT_RUN`, `EXPERIMENT_BLOCKED`,
 `EXPERIMENT_FAILED`, `EXPERIMENT_INCOMPLETE`, `NEEDS_PROJECT_EVIDENCE`,
 `REPRODUCED_BENEFIT_UNPROVEN`, `BENEFIT_PENDING_REVIEW`, `BENEFIT_CRITERIA_MET`, `BENEFIT_DEMONSTRATED`,
@@ -242,7 +244,7 @@ This mode does not confirm that the system is fit to execute arbitrary untrusted
 - URL import resolves the host, validates every returned address and connects to a validated address (the TLS name stays the
   host name), including after redirects; environment HTTP proxies are ignored, so there is no proxy-side resolution. Remaining:
   the check trusts the system resolver's answer; the hard-coded `198.18.0.0/15` allowance exists for TUN fake-IP DNS and applies only to arxiv.org, www.nature.com,
-  github.com and raw.githubusercontent.com. Import research from sources you trust, or from local files.
+  idp.nature.com, static-content.springer-cdn.com, github.com and raw.githubusercontent.com. Import research from sources you trust, or from local files.
 - At registration the source and input trees are copied into `<workspace>/snapshots/<experiment>/`, the copy is hashed and must
   equal the hash of the live directory (otherwise registration fails: the directory changed while being copied). Containers
   mount only the copy, and its hash is checked before baseline and again before candidate. If either source or input snapshot

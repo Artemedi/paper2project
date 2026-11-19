@@ -11,28 +11,37 @@ from pathlib import Path
 import sys
 
 from . import __version__
+from .store import loads
 
 PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")
 S, I, O, A, B = "string", "integer", "object", "array", "boolean"
 
 
-def tool(name, description, properties, required, call, *, readonly=False, gate=None):
+def tool(name, description, properties, required, call, *, readonly=False, gate=None, open_world=False):
+    props = {k: ({"type": A, "items": {"type": S}} if v == A else {"type": v}) for k, v in properties.items()}
     return {"name": name, "description": description, "call": call, "gate": gate,
-            "inputSchema": {"type": "object", "properties": {k: {"type": v} for k, v in properties.items()},
+            "inputSchema": {"type": "object", "properties": props,
                             "required": required, "additionalProperties": False},
-            "annotations": {"readOnlyHint": readonly, "destructiveHint": False, "openWorldHint": gate == "network"}}
+            "annotations": {"readOnlyHint": readonly, "destructiveHint": False,
+                            "openWorldHint": bool(open_world or gate == "network")}}
 
 
 def tools(app):
     return [
         tool("projects", "List imported project snapshots.", {}, [], lambda a: app.store.list("project"), readonly=True),
         tool("research", "List imported research snapshots with coverage status.", {}, [], lambda a: app.research(), readonly=True),
+        tool("jobs", "List jobs in the workspace.", {}, [],
+             lambda a: [{k: j[k] for k in ("id", "created_at")} for j in app.store.list("job")], readonly=True),
         tool("project_import", "Import a project Markdown file or a directory of project memories (inside an allowed root).",
              {"path": S, "layout": S, "name": S, "project_id": S}, ["path"],
              lambda a: app.import_projects(a["path"], a.get("layout", "auto"), a.get("name"), a.get("project_id"))),
+        tool("project_attach", "Attach a local file (<=8 MiB) to a project snapshot (inside an allowed root).",
+             {"project_id": S, "path": S, "name": S}, ["project_id", "path"],
+             lambda a: app.attach_asset(a["project_id"], a["path"], a.get("name"))),
         tool("research_import", "Import research Markdown/PDF/package from an allowed path, or https URL when network is allowed.",
              {"source": S, "title": S, "research_id": S, "origin": S}, ["source"],
-             lambda a: app.import_research(a["source"], a.get("title"), a.get("research_id"), a.get("origin"))),
+             lambda a: app.import_research(a["source"], a.get("title"), a.get("research_id"), a.get("origin")),
+             open_world=True),
         tool("job_create", "Bind one research snapshot to 1..100 project snapshots.", {"research_id": S, "project_ids": A}, ["research_id", "project_ids"],
              lambda a: app.create_job(a["research_id"], a["project_ids"])),
         tool("job_status", "Job state, stale evidence and bound snapshots.", {"job_id": S}, ["job_id"], lambda a: app.status(a["job_id"]), readonly=True),
@@ -50,6 +59,9 @@ def tools(app):
              ["job_id", "decision", "notes", "reviewer", "analysis"],
              lambda a: app.review_analysis(a["job_id"], a["decision"], a["notes"], a["reviewer"], a["analysis"],
                                            a.get("project_id"), a.get("evidence"), a.get("verified_experiments")), gate="review"),
+        tool("finding_review", "Record a scoped premise and test-link review for one finding.",
+             {"job_id": S, "review": O, "project_id": S}, ["job_id", "review"],
+             lambda a: app.review_finding(a["job_id"], a.get("project_id"), a["review"]), gate="review"),
         tool("experiment_add", "Register a source-bound experiment plan (see docs for the schema).", {"job_id": S, "plan": O}, ["job_id", "plan"],
              lambda a: app.add_experiment(a["job_id"], a["plan"])),
         tool("experiment_run", "Run baseline and candidate in separate offline containers and score them on the host.",
@@ -66,9 +78,12 @@ def check(schema, args):
     if not isinstance(args, dict) or set(args) - set(schema["properties"]) or any(k not in args for k in schema["required"]):
         raise ValueError("Invalid tool arguments")
     for key, value in args.items():
-        kind = schema["properties"][key]["type"]
+        prop = schema["properties"][key]
+        kind = prop["type"]
         if not isinstance(value, TYPES[kind]) or (kind == I and isinstance(value, bool)):
             raise ValueError(f"Argument {key} must be {kind}")
+        if prop.get("type") == A and prop.get("items", {}).get("type") == S and not all(isinstance(item, str) for item in value):
+            raise ValueError(f"Argument {key} items must be string")
 
 
 def handle(request, app, listing, allow_execution, allow_network, allow_review=False):
@@ -95,12 +110,13 @@ def handle(request, app, listing, allow_execution, allow_network, allow_review=F
         try:
             if entry is None:
                 raise ValueError("Unknown tool")
-            check(entry["inputSchema"], params.get("arguments", {}))
+            raw_args = params.get("arguments")
+            arguments = {} if raw_args is None else raw_args
+            check(entry["inputSchema"], arguments)
             if entry["gate"] == "execution" and not allow_execution:
                 raise ValueError("Container execution is disabled; start the server with --allow-execution")
             if entry["gate"] == "review" and not allow_review:
                 raise ValueError("Review over MCP is disabled so the analysing agent cannot approve itself; use the CLI, or start the server with --allow-review for a separate reviewer session")
-            arguments = params.get("arguments", {})
             if entry["name"] == "research_import" and arguments["source"].startswith(("https://", "http://")) and not allow_network:
                 raise ValueError("URL import is disabled; start the server with --allow-network")
             result = {"content": [{"type": "text", "text": json.dumps(entry["call"](arguments), ensure_ascii=False)}], "isError": False}
@@ -122,7 +138,7 @@ def serve(app, allow_roots=(), allow_execution=False, allow_network=False, allow
             print("MCP message exceeds 8 MiB; closing", file=sys.stderr)
             return None
         try:
-            response = handle(json.loads(line), app, listing, allow_execution, allow_network, allow_review)
+            response = handle(loads(line), app, listing, allow_execution, allow_network, allow_review)
         except (ValueError, UnicodeError, RecursionError):
             response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
         except Exception as exc:

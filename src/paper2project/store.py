@@ -72,14 +72,14 @@ def unique(prefix):
 def regular_file(path):
     """Open one regular file through non-symlink directory descriptors."""
     parts = Path(path).absolute().parts
-    directory = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY)
+    directory = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     file_fd = None
     try:
         for part in parts[1:-1]:
-            next_dir = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            next_dir = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
             os.close(directory)
             directory = next_dir
-        file_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        file_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
         if not stat.S_ISREG(os.fstat(file_fd).st_mode):
             raise ValueError("Input is not a regular file")
         with os.fdopen(file_fd, "rb") as stream:
@@ -160,6 +160,17 @@ if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_forget_locks_in_child)
 
 
+_ID_KINDS = frozenset({"project", "research", "job", "experiment", "run"})
+
+
+def _validated_record(kind, key, body):
+    """Decode one record body and verify its embedded id matches the SQLite key."""
+    record = loads(body)
+    if kind in _ID_KINDS and (not isinstance(record, dict) or record.get("id") != key):
+        raise ValueError(f"{kind.capitalize()} record index disagrees with its body: {key}")
+    return record
+
+
 class Store:
     def __init__(self, root):
         if fcntl is None:
@@ -169,11 +180,11 @@ class Store:
             raise ValueError("Workspace must not be a symlink")
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.root = self.root.resolve()
-        for name in ("objects", "runs", "sources", "environments"):
+        for name in ("objects", "runs", "snapshots"):
             path = self.root / name
             if path.is_symlink():
                 raise ValueError("Workspace directories must not be symlinks")
-            path.mkdir(exist_ok=True)
+            path.mkdir(exist_ok=True, mode=0o700)
         database = self.root / "state.sqlite3"
         if database.is_symlink():
             raise ValueError("Database must not be a symlink")
@@ -226,7 +237,7 @@ class Store:
                 os.fsync(stream.fileno())
             try:
                 os.link(temporary, path)
-                directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
                 try:
                     os.fsync(directory)  # publish the object name before committing its metadata reference
                 finally:
@@ -243,9 +254,11 @@ class Store:
         if not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key):
             raise ValueError("Invalid object hash")
         path = self.root / "objects" / key
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("Missing or unsafe object: " + key)
-        value = path.read_bytes()
+        try:
+            with regular_file(path) as stream:
+                value = stream.read()
+        except (OSError, ValueError):
+            raise ValueError("Missing or unsafe object: " + key) from None
         if digest(value) != key:
             raise ValueError("Object integrity check failed: " + key)
         return value
@@ -282,17 +295,11 @@ class Store:
             row = db.execute("SELECT body FROM records WHERE kind=? AND id=?", (kind,key)).fetchone()
         if row is None:
             raise ValueError(f"Unknown {kind}: {key}")
-        return loads(row[0])
+        return _validated_record(kind, key, row[0])
 
     def list(self, kind, *, insertion_order=False):
         identifier(kind)
         with self.db() as db:
             order = "rowid" if insertion_order else "id"
             rows = db.execute(f"SELECT id,body FROM records WHERE kind=? ORDER BY {order}", (kind,)).fetchall()
-        records = []
-        for key, body in rows:
-            record = loads(body)
-            if kind == "run" and record.get("id") != key:
-                raise ValueError("Run record index disagrees with its body: " + key)
-            records.append(record)
-        return records
+        return [_validated_record(kind, key, body) for key, body in rows]

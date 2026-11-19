@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import warnings
 
 MAX_BYTES = 32 * 1024 * 1024
 MEMORY_BYTES = 512 * 1024 * 1024
@@ -20,7 +21,7 @@ def extract(raw):
     if sys.platform != "linux":
         raise ValueError("Resource-limited PDF import requires Linux")
     if len(raw) > MAX_BYTES:
-        raise ValueError("PDF exceeds32MiB")
+        raise ValueError("PDF exceeds 32 MiB")
     # Regular temporary files let RLIMIT_FSIZE bound output before the parent reads it.
     with tempfile.TemporaryFile() as source, tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
         source.write(raw)
@@ -48,7 +49,7 @@ def extract(raw):
         output.seek(0)
         text = output.read(MAX_BYTES + 1)
         if len(text) > MAX_BYTES:
-            raise ValueError("PDF extracted text exceeds32MiB")
+            raise ValueError("PDF extracted text exceeds 32 MiB")
         try:
             return text.decode("utf-8")
         except UnicodeError as exc:
@@ -58,9 +59,10 @@ def extract(raw):
 PUBLIC_ERRORS = {
     "Install the distribution's pypdf dependency to import PDFs",
     "Encrypted research PDF is not supported",
-    "PDF exceeds300 pages",
+    "PDF exceeds 32 MiB",
+    "PDF exceeds 300 pages",
     "PDF has no extractable text; supply reviewed Markdown/OCR",
-    "PDF extracted text exceeds32MiB",
+    "PDF extracted text exceeds 32 MiB",
 }
 
 
@@ -83,7 +85,7 @@ def _text(raw):
     if reader.is_encrypted:
         raise ValueError("Encrypted research PDF is not supported")
     if len(reader.pages) > 300:
-        raise ValueError("PDF exceeds300 pages")
+        raise ValueError("PDF exceeds 300 pages")
     parts, size, has_text = [], 0, False
     for i, page in enumerate(reader.pages):
         text = (page.extract_text() or "").replace("\0", "\ufffd")  # extractors can emit NUL
@@ -91,7 +93,7 @@ def _text(raw):
         part = ("\n\n" if i else "") + f"# PDF page {i+1}\n{text}"
         size += len(part.encode("utf-8"))
         if size > MAX_BYTES:
-            raise ValueError("PDF extracted text exceeds32MiB")
+            raise ValueError("PDF extracted text exceeds 32 MiB")
         parts.append(part)
     if not has_text:
         raise ValueError("PDF has no extractable text; supply reviewed Markdown/OCR")
@@ -102,9 +104,10 @@ def _main():
     try:
         _limits()
         logging.disable(logging.CRITICAL)
+        warnings.simplefilter("ignore")
         raw = sys.stdin.buffer.read(MAX_BYTES + 1)
         if len(raw) > MAX_BYTES:
-            raise ValueError("PDF exceeds32MiB")
+            raise ValueError("PDF exceeds 32 MiB")
         sys.stdout.buffer.write(_text(raw).encode("utf-8"))
         sys.stdout.buffer.flush()
     except Exception as exc:

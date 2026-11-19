@@ -20,6 +20,3 @@ paper2project = "paper2project.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-paper2project = ["templates/*.md", "templates/*.json"]
